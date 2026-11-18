@@ -1,0 +1,864 @@
+#!/usr/bin/env python3
+"""journeymaxx: review a batch of user journeys from the terminal.
+
+Claude writes journeys into a .journeymaxx file (JSON); you run `journeymaxx`
+next to the Claude session and go through them: enter approves, c sends Claude
+a message, ctrl+g edits in vim, r rejects.
+
+  You:     journeymaxx                      review (TUI)
+  Claude:  journeymaxx add < journeys.md    queue journeys (markdown split by ---, or JSON)
+           journeymaxx wait                 block until there is feedback, then print it
+           journeymaxx feedback             print feedback not yet read
+           journeymaxx revise ID -m "..."   new text on stdin, back to pending
+           journeymaxx ask ID "..."         question or pushback he must answer, back to pending
+           journeymaxx reply ID "..."       a note on the thread; stays out of his queue
+           journeymaxx list | show ID | export
+"""
+import argparse
+import curses
+import difflib
+import fcntl
+import json
+import locale
+import os
+import re
+import shlex
+import subprocess
+import sys
+import tempfile
+import textwrap
+import time
+from datetime import datetime
+
+FILENAME = ".journeymaxx"
+STATUSES = ("pending", "approved", "changes_requested", "rejected")
+LABELS = {
+    "pending": "PENDING",
+    "approved": "APPROVED",
+    "changes_requested": "CHANGE REQUESTED",
+    "rejected": "REJECTED",
+}
+NEEDS_CLAUDE = ("comment", "rejected", "edited", "reopened")
+
+
+def now():
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def hhmm(stamp):
+    try:
+        return datetime.fromisoformat(stamp).strftime("%H:%M")
+    except (TypeError, ValueError):
+        return ""
+
+
+# ---------------------------------------------------------------- storage
+
+def find_file(explicit):
+    if explicit:
+        return os.path.abspath(explicit)
+    if os.environ.get("JOURNEYMAXX_FILE"):
+        return os.path.abspath(os.environ["JOURNEYMAXX_FILE"])
+    d = os.getcwd()
+    while True:
+        p = os.path.join(d, FILENAME)
+        if os.path.isfile(p):
+            return p
+        parent = os.path.dirname(d)
+        if parent == d:
+            break
+        d = parent
+    # No file yet. In a git worktree, put it in the main checkout so a Claude
+    # session in a worktree and a reviewer in the main checkout share one file.
+    try:
+        common = subprocess.run(
+            ["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if common.returncode == 0 and common.stdout.strip().endswith("/.git"):
+            return os.path.join(os.path.dirname(common.stdout.strip()), FILENAME)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return os.path.join(os.getcwd(), FILENAME)
+
+
+def empty():
+    return {"version": 1, "next_id": 1, "journeys": []}
+
+
+def parse(text):
+    if not text.strip():
+        return empty()
+    data = json.loads(text)
+    data.setdefault("version", 1)
+    data.setdefault("journeys", [])
+    data.setdefault("next_id", max([j["id"] for j in data["journeys"]] + [0]) + 1)
+    return data
+
+
+class Store:
+    def __init__(self, path):
+        self.path = path
+
+    def read(self):
+        try:
+            with open(self.path, encoding="utf-8") as f:
+                fcntl.flock(f, fcntl.LOCK_SH)
+                return parse(f.read())
+        except FileNotFoundError:
+            return empty()
+
+    def mutate(self, fn):
+        fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+        with os.fdopen(fd, "r+", encoding="utf-8") as f:
+            fcntl.flock(f, fcntl.LOCK_EX)
+            data = parse(f.read())
+            result = fn(data)
+            f.seek(0)
+            f.truncate()
+            json.dump(data, f, indent=2, ensure_ascii=False)
+            f.write("\n")
+            f.flush()
+        return result
+
+    def mtime(self):
+        try:
+            return os.stat(self.path).st_mtime_ns
+        except FileNotFoundError:
+            return 0
+
+
+def find(data, jid):
+    for j in data["journeys"]:
+        if j["id"] == jid:
+            return j
+    return None
+
+
+def event(j, by, action, **extra):
+    e = {"at": now(), "by": by, "action": action}
+    e.update({k: v for k, v in extra.items() if v is not None})
+    if by == "reviewer":
+        e["seen"] = False  # flipped once `feedback` / `wait` has shown it to Claude
+    j["history"].append(e)
+    j["updated_at"] = e["at"]
+    return e
+
+
+def set_status(j, status):
+    j["status"] = status
+    if status != "pending":
+        j[status + "_at"] = now()
+
+
+def counts(data):
+    c = {s: 0 for s in STATUSES}
+    for j in data["journeys"]:
+        c[j["status"]] = c.get(j["status"], 0) + 1
+    return c
+
+
+def summary(data):
+    c = counts(data)
+    return (f"{c['pending']} pending · {c['approved']} approved · "
+            f"{c['changes_requested']} change requested · {c['rejected']} rejected")
+
+
+# ---------------------------------------------------------------- parsing input
+
+def clean_title(line):
+    line = re.sub(r"^#+\s*", "", line.strip())
+    m = re.fullmatch(r"\*\*(.+?)\*\*", line)
+    return (m.group(1) if m else line).strip()
+
+
+def split_title(chunk):
+    lines = chunk.strip().splitlines()
+    if not lines:
+        return ("", "")
+    return (clean_title(lines[0]), "\n".join(lines[1:]).strip())
+
+
+def parse_journeys(text):
+    s = text.strip()
+    if s[:1] in ("[", "{"):
+        try:
+            data = json.loads(s)
+        except ValueError:
+            data = None
+        if data is not None:
+            if isinstance(data, dict):
+                data = data.get("journeys", [data])
+            out = []
+            for item in data:
+                if isinstance(item, str):
+                    out.append(split_title(item))
+                else:
+                    out.append((str(item.get("title", "")).strip(), str(item.get("body", "")).strip()))
+            return out
+    return [split_title(c) for c in re.split(r"(?m)^\s*---+\s*$", text) if c.strip()]
+
+
+# ---------------------------------------------------------------- commands for Claude
+
+def stdin_text():
+    return "" if sys.stdin.isatty() else sys.stdin.read()
+
+
+def cmd_add(store, args):
+    if args.title:
+        body = args.body if args.body is not None else stdin_text()
+        items = [(args.title.strip(), body.strip())]
+    else:
+        items = parse_journeys(args.body if args.body is not None else stdin_text())
+    items = [(t, b) for t, b in items if t or b]
+    if not items:
+        sys.exit("journeymaxx: nothing to add. Pipe markdown (journeys split by a --- line, "
+                 "first line is the title) or a JSON array of {title, body}.")
+
+    def fn(data):
+        ids = []
+        for title, body in items:
+            stamp = now()
+            j = {"id": data["next_id"], "title": title, "body": body, "status": "pending",
+                 "created_at": stamp, "updated_at": stamp, "approved_at": None,
+                 "rejected_at": None, "changes_requested_at": None, "history": []}
+            event(j, "claude", "added")
+            data["next_id"] += 1
+            data["journeys"].append(j)
+            ids.append(j["id"])
+        return ids, summary(data)
+
+    ids, summ = store.mutate(fn)
+    span = f"#{ids[0]}" if len(ids) == 1 else f"#{ids[0]}–#{ids[-1]}"
+    print(f"added {len(ids)} ({span}) to {store.path}")
+    print(summ)
+    print(f"review with: journeymaxx -f {shlex.quote(store.path)}")
+
+
+def need(data, jid):
+    j = find(data, jid)
+    if j is None:
+        sys.exit(f"journeymaxx: no journey #{jid}")
+    return j
+
+
+def cmd_revise(store, args):
+    body = args.body if args.body is not None else stdin_text()
+    if not body.strip() and not args.title:
+        sys.exit("journeymaxx: give the new text on stdin (or --body), and/or --title")
+
+    def fn(data):
+        j = need(data, args.id)
+        prev_title, prev_body = j["title"], j["body"]
+        if args.title:
+            j["title"] = args.title.strip()
+        if body.strip():
+            j["body"] = body.strip()
+        event(j, "claude", "revised", message=args.message,
+              previous_title=prev_title, previous_body=prev_body)
+        set_status(j, "pending")
+
+    store.mutate(fn)
+    print(f"#{args.id} revised, back to pending")
+
+
+def cmd_reply(store, args):
+    """A note on the thread. It does not come back into the review queue."""
+    def fn(data):
+        j = need(data, args.id)
+        event(j, "claude", "reply", message=args.message)
+        return j["status"]
+
+    status = store.mutate(fn)
+    print(f"#{args.id} note added; it stays {status} and out of the review queue. "
+          "Use `ask` only for a question, pushback or contradiction the reviewer must answer.")
+
+
+def cmd_ask(store, args):
+    """A question or pushback the reviewer has to answer: back to pending."""
+    def fn(data):
+        j = need(data, args.id)
+        event(j, "claude", "question", message=args.message)
+        set_status(j, "pending")
+
+    store.mutate(fn)
+    print(f"#{args.id} question sent, back to pending")
+
+
+def collect_feedback(data, mark):
+    out = []
+    for j in data["journeys"]:
+        evs = [e for e in j["history"] if e.get("by") == "reviewer" and e.get("seen") is False]
+        if not evs:
+            continue
+        out.append({"id": j["id"], "title": j["title"], "body": j["body"], "status": j["status"],
+                    "events": [{k: e[k] for k in ("at", "action", "message") if k in e} for e in evs]})
+        if mark:
+            for e in evs:
+                e["seen"] = True
+    return out
+
+
+def print_feedback(items, data, as_json):
+    if as_json:
+        print(json.dumps({"feedback": items, "counts": counts(data)}, indent=2, ensure_ascii=False))
+        return
+    quiet = [i for i in items if all(e["action"] == "approved" for e in i["events"])]
+    loud = [i for i in items if i not in quiet]
+    if quiet:
+        print("approved: " + " ".join(f"#{i['id']}" for i in quiet))
+    for i in loud:
+        print(f"\n#{i['id']} [{i['status']}] {i['title']}")
+        for e in i["events"]:
+            msg = e.get("message")
+            if e["action"] == "comment":
+                print(f"  comment: {msg}")
+            elif e["action"] == "rejected":
+                print("  rejected" + (f": {msg}" if msg else ""))
+            elif e["action"] == "edited":
+                print("  edited by the reviewer; the text is now:")
+                print(textwrap.indent(f"{i['title']}\n\n{i['body']}", "    | "))
+            else:
+                print(f"  {e['action']}" + (f": {msg}" if msg else ""))
+    if not items:
+        print("no new feedback")
+    print("\n" + summary(data))
+
+
+def cmd_feedback(store, args):
+    if args.peek:
+        data = store.read()
+        items = collect_feedback(data, mark=False)
+    else:
+        items, data = store.mutate(lambda d: (collect_feedback(d, mark=True), d))
+    print_feedback(items, data, args.json)
+
+
+def cmd_wait(store, args):
+    deadline = time.time() + args.timeout if args.timeout else None
+    seen_mtime = None
+    while True:
+        m = store.mtime()
+        if m != seen_mtime:
+            seen_mtime = m
+            data = store.read()
+            unseen = [e for j in data["journeys"] for e in j["history"]
+                      if e.get("by") == "reviewer" and e.get("seen") is False]
+            if any(e["action"] in NEEDS_CLAUDE for e in unseen) or counts(data)["pending"] == 0:
+                args.peek = False
+                cmd_feedback(store, args)
+                return
+        if deadline and time.time() > deadline:
+            print(f"no feedback yet ({summary(store.read())})")
+            sys.exit(2)
+        time.sleep(1)
+
+
+def cmd_list(store, args):
+    data = store.read()
+    js = [j for j in data["journeys"] if not args.status or j["status"] == args.status]
+    if args.json:
+        print(json.dumps(js, indent=2, ensure_ascii=False))
+        return
+    for j in js:
+        print(f"#{j['id']:<4} {j['status']:<18} {j['title']}")
+    print(summary(data))
+    print(store.path)
+
+
+def cmd_show(store, args):
+    j = need(store.read(), args.id)
+    print(f"#{j['id']} [{j['status']}] {j['title']}\n\n{j['body']}")
+    thread = [e for e in j["history"] if e["action"] != "added"]
+    if thread:
+        print()
+    for e in thread:
+        print(f"  {e['at']} {e['by']} {e['action']}" + (f": {e['message']}" if e.get("message") else ""))
+
+
+def cmd_export(store, args):
+    js = [j for j in store.read()["journeys"] if args.status == "all" or j["status"] == args.status]
+    print("\n\n".join(f"**{j['title']}**\n\n{j['body']}".strip() for j in js))
+
+
+# ---------------------------------------------------------------- TUI
+
+def md_lines(text, width, base=0):
+    """Wrap light markdown (bullets, **bold**, # headings) into rows of (text, attr) segments."""
+    rows = []
+    for raw in text.splitlines():
+        if not raw.strip():
+            rows.append([])
+            continue
+        attr = base
+        first, rest = "", ""
+        m = re.match(r"^(\s*)([-*•]|\d+[.)])\s+", raw)
+        h = re.match(r"^#+\s+", raw)
+        if m:
+            marker = "•" if m.group(2) in "-*•" else m.group(2)
+            first = m.group(1) + marker + " "
+            rest = " " * len(first)
+            raw = raw[m.end():]
+        elif h:
+            raw = raw[h.end():]
+            attr |= curses.A_BOLD
+        tokens = []  # (word, attr, space_before)
+        for n, part in enumerate(raw.split("**")):
+            a = attr | (curses.A_BOLD if n % 2 else 0)
+            for piece in re.findall(r"\s+|\S+", part):
+                if piece.isspace():
+                    tokens.append(None)
+                else:
+                    tokens.append((piece, a))
+        row, used, gap = [(first, base)] if first else [], len(first), False
+        start = used  # where words begin on the current row
+        for tok in tokens:
+            if tok is None:
+                gap = True
+                continue
+            word, a = tok
+            lead = " " if gap and used > start else ""
+            if used + len(lead) + len(word) > width and used > start:
+                rows.append(row)
+                row, used, lead = ([(rest, base)] if rest else []), len(rest), ""
+                start = used
+            row.append((lead + word, a))
+            used += len(lead) + len(word)
+            gap = False
+        rows.append(row)
+    return rows
+
+
+class Review:
+    def __init__(self, scr, store):
+        self.scr = scr
+        self.store = store
+        self.data = empty()
+        self.mtime = None
+        self.cur = None       # id of the journey on screen; None = caught-up screen
+        self.scroll = 0
+        self.diff = False
+        self.flash = ""
+        self.color = {}
+
+    # -- state
+
+    def reload(self):
+        self.mtime = self.store.mtime()
+        try:
+            self.data = self.store.read()
+        except ValueError:
+            self.flash = "could not read the file (invalid JSON)"
+
+    def journey(self):
+        return find(self.data, self.cur) if self.cur is not None else None
+
+    def goto(self, jid):
+        if jid != self.cur:
+            self.cur, self.scroll, self.diff = jid, 0, False
+
+    def next_pending(self):
+        js = self.data["journeys"]
+        idx = next((i for i, j in enumerate(js) if j["id"] == self.cur), -1)
+        order = js[idx + 1:] + js[:idx + 1]
+        nxt = next((j for j in order if j["status"] == "pending" and j["id"] != self.cur), None)
+        self.goto(nxt["id"] if nxt else None)
+
+    def step(self, delta):
+        js = self.data["journeys"]
+        if not js:
+            return
+        idx = next((i for i, j in enumerate(js) if j["id"] == self.cur), None)
+        if idx is None:
+            idx = 0 if delta > 0 else len(js) - 1
+        else:
+            idx = max(0, min(len(js) - 1, idx + delta))
+        self.goto(js[idx]["id"])
+
+    def change(self, fn):
+        jid = self.cur
+
+        def wrapped(data):
+            j = find(data, jid)
+            if j is not None:
+                fn(j)
+
+        self.store.mutate(wrapped)
+        self.reload()
+
+    # -- actions
+
+    def approve(self):
+        j = self.journey()
+        if j is None:
+            return
+        if j["status"] != "approved":
+            self.change(lambda j: (set_status(j, "approved"), event(j, "reviewer", "approved")))
+            self.flash = f"#{j['id']} approved"
+        self.next_pending()
+
+    def comment(self):
+        j = self.journey()
+        if j is None:
+            return
+        text = self.prompt(f"Message to Claude about #{j['id']}")
+        if not text:
+            return
+        self.change(lambda j: (set_status(j, "changes_requested"),
+                               event(j, "reviewer", "comment", message=text)))
+        self.flash = f"#{j['id']} sent to Claude"
+        self.next_pending()
+
+    def reject(self):
+        j = self.journey()
+        if j is None:
+            return
+        text = self.prompt(f"Reject #{j['id']}: reason (enter to skip)", allow_empty=True)
+        if text is None:
+            return
+        self.change(lambda j: (set_status(j, "rejected"),
+                               event(j, "reviewer", "rejected", message=text or None)))
+        self.flash = f"#{j['id']} rejected"
+        self.next_pending()
+
+    def reopen(self):
+        j = self.journey()
+        if j is None or j["status"] == "pending":
+            return
+        self.change(lambda j: (set_status(j, "pending"), event(j, "reviewer", "reopened")))
+        self.flash = f"#{j['id']} back to pending"
+
+    def edit(self):
+        j = self.journey()
+        if j is None:
+            return
+        new = self.editor(f"# {j['title']}\n\n{j['body']}\n")
+        if new is None:
+            return
+        title, body = split_title(new)
+        if (title, body) == (j["title"], j["body"]):
+            self.flash = "no changes"
+            return
+
+        def fn(j):
+            prev_title, prev_body = j["title"], j["body"]
+            j["title"], j["body"] = title, body
+            event(j, "reviewer", "edited", previous_title=prev_title, previous_body=prev_body)
+
+        self.change(fn)
+        self.flash = f"#{j['id']} edited · enter to approve"
+
+    def editor(self, text):
+        cmd = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vim")
+        fd, path = tempfile.mkstemp(prefix="journeymaxx-", suffix=".md")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+            curses.endwin()
+            try:
+                code = subprocess.call(cmd + [path])
+            except OSError as e:
+                self.flash = f"could not start {cmd[0]}: {e}"
+                return None
+            finally:
+                self.scr.refresh()
+                curses.curs_set(0)
+            if code != 0:
+                self.flash = "edit cancelled"
+                return None
+            with open(path, encoding="utf-8") as f:
+                return f.read()
+        finally:
+            os.unlink(path)
+
+    # -- drawing
+
+    def put(self, y, x, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h and x < w - 1:
+            try:
+                self.scr.addnstr(y, x, text, w - 1 - x, attr)
+            except curses.error:
+                pass
+
+    def status_attr(self, status):
+        return self.color.get(status, 0) | curses.A_BOLD
+
+    def content(self, j, width):
+        dim = curses.A_DIM
+        rows = md_lines(f"#{j['id']}  {j['title']}", width, curses.A_BOLD)
+        badge = [(LABELS[j["status"]], self.status_attr(j["status"]))]
+        last = j["history"][-1] if j["history"] else None
+        if last and last["by"] == "claude" and last["action"] in ("revised", "reply", "question"):
+            what = {"revised": "revised", "reply": "left a note", "question": "has a question"}[last["action"]]
+            badge.append((f"  · Claude {what} {hhmm(last['at'])}", self.color.get("claude", 0)))
+        rows += [badge, []]
+
+        prev = next((e for e in reversed(j["history"]) if "previous_body" in e), None)
+        if self.diff and prev:
+            old = f"{prev.get('previous_title', '')}\n\n{prev['previous_body']}".splitlines()
+            new = f"{j['title']}\n\n{j['body']}".splitlines()
+            for line in difflib.ndiff(old, new):
+                if line.startswith("?"):
+                    continue
+                attr = {"+": self.color.get("approved", 0), "-": self.color.get("rejected", 0)}.get(line[0], dim)
+                for n, part in enumerate(textwrap.wrap(line[2:], width - 2) or [""]):
+                    rows.append([((line[0] if n == 0 else " ") + " " + part, attr)])
+        else:
+            rows += md_lines(j["body"], width)
+
+        thread = [e for e in j["history"] if e["action"] != "added"]
+        if thread:
+            rows += [[], [("─" * min(width, 40), dim)]]
+        for e in thread:
+            who = "you" if e["by"] == "reviewer" else "claude"
+            attr = 0 if e["by"] == "reviewer" else self.color.get("claude", 0)
+            head = f"{hhmm(e['at'])} {who} {e['action'].replace('_', ' ')}"
+            if e.get("message"):
+                msg = md_lines(e["message"], width - 4)
+                rows.append([(head + ":", attr | curses.A_BOLD)])
+                rows += [[("    ", 0)] + r for r in msg]
+            else:
+                rows.append([(head, attr | dim)])
+        return rows, bool(prev)
+
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        width = max(20, min(w - 4, 92))
+        js = self.data["journeys"]
+        j = self.journey()
+
+        pos = ""
+        if j is not None:
+            pos = f"{next(i for i, x in enumerate(js) if x['id'] == j['id']) + 1}/{len(js)}"
+        self.put(0, 1, "journeymaxx", curses.A_BOLD)
+        self.put(0, 14, summary(self.data), curses.A_DIM)
+        self.put(0, max(14, w - len(pos) - 2), pos, curses.A_DIM)
+
+        keys = "↑↓ move · q quit"
+        if j is None:
+            if not js:
+                msg, sub = "No journeys yet.", f"Waiting for Claude to add some to {self.store.path}"
+            else:
+                msg, sub = "All caught up.", "New and revised journeys show up here as Claude adds them."
+            self.put(h // 2 - 1, 2, msg, curses.A_BOLD)
+            self.put(h // 2, 2, sub, curses.A_DIM)
+        else:
+            rows, has_prev = self.content(j, width)
+            avail = max(1, h - 5)
+            self.scroll = max(0, min(self.scroll, len(rows) - avail))
+            for n, row in enumerate(rows[self.scroll:self.scroll + avail]):
+                x = 2
+                for text, attr in row:
+                    self.put(2 + n, x, text, attr)
+                    x += len(text)
+            if self.scroll + avail < len(rows):
+                self.put(h - 3, 2, "▼ more (space)", curses.A_DIM)
+            keys = ("enter approve · c message Claude · ^G edit · r reject · u undo"
+                    + (" · d diff" if has_prev else "") + " · ↑↓ move · n next pending · q quit")
+        if self.flash:
+            self.put(h - 2, 2, self.flash, self.color.get("approved", 0))
+        self.put(h - 1, 1, keys, curses.A_DIM)
+        scr.refresh()
+
+    def prompt(self, label, allow_empty=False):
+        """One-field input at the bottom. Returns the text, or None when cancelled."""
+        buf = ""
+        self.scr.timeout(-1)
+        curses.curs_set(1)
+        try:
+            while True:
+                self.draw()
+                h, w = self.scr.getmaxyx()
+                width = max(10, w - 6)
+                lines = []
+                for para in (buf + "█").split("\n"):
+                    lines += textwrap.wrap(para, width, drop_whitespace=False) or [""]
+                lines = lines[-max(1, h - 6):]
+                top = h - len(lines) - 3
+                for y in range(top, h):
+                    self.scr.move(max(0, y), 0)
+                    self.scr.clrtoeol()
+                self.put(top, 1, label, curses.A_BOLD)
+                for n, line in enumerate(lines):
+                    self.put(top + 1 + n, 1, "> " if n == 0 else "  ", curses.A_DIM)
+                    self.put(top + 1 + n, 3, line.replace("█", ""))
+                last = lines[-1].replace("█", "")
+                self.put(h - 1, 1, "enter send · esc cancel · ^G write in editor", curses.A_DIM)
+                try:
+                    self.scr.move(top + len(lines), min(w - 2, 3 + len(last)))
+                except curses.error:
+                    pass
+                self.scr.refresh()
+                try:
+                    ch = self.scr.get_wch()
+                except curses.error:
+                    continue
+                except KeyboardInterrupt:
+                    return None
+                if ch in ("\n", "\r", curses.KEY_ENTER):
+                    text = buf.strip()
+                    if text or allow_empty:
+                        return text
+                    return None
+                if ch == "\x1b":
+                    return None
+                if ch == "\x07":
+                    edited = self.editor(buf)
+                    if edited is not None:
+                        buf = edited.strip()
+                elif ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
+                    buf = buf[:-1]
+                elif ch == "\x15":
+                    buf = ""
+                elif ch == "\x17":
+                    buf = re.sub(r"\S*\s*$", "", buf)
+                elif isinstance(ch, str) and ch.isprintable():
+                    buf += ch
+        finally:
+            curses.curs_set(0)
+            self.scr.timeout(400)
+
+    # -- loop
+
+    def run(self):
+        curses.curs_set(0)
+        curses.set_escdelay(25)
+        try:
+            curses.use_default_colors()
+            for n, (name, col) in enumerate([("approved", curses.COLOR_GREEN),
+                                             ("changes_requested", curses.COLOR_YELLOW),
+                                             ("rejected", curses.COLOR_RED),
+                                             ("pending", curses.COLOR_CYAN),
+                                             ("claude", curses.COLOR_MAGENTA)], start=1):
+                curses.init_pair(n, col, -1)
+                self.color[name] = curses.color_pair(n)
+        except curses.error:
+            pass
+        self.scr.timeout(400)
+        self.reload()
+        self.next_pending()
+        while True:
+            if self.store.mtime() != self.mtime:
+                self.reload()
+            if self.cur is not None and self.journey() is None:
+                self.cur = None
+            if self.cur is None:
+                self.next_pending()  # jump to new work as soon as Claude adds it
+            self.draw()
+            try:
+                ch = self.scr.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                return
+            self.flash = ""
+            if ch in ("q", "Q"):
+                return
+            elif ch in ("\n", "\r", curses.KEY_ENTER):
+                self.approve()
+            elif ch in ("c", "C"):
+                self.comment()
+            elif ch in ("\x07", "e"):
+                self.edit()
+            elif ch == "r":
+                self.reject()
+            elif ch == "u":
+                self.reopen()
+            elif ch == "d":
+                self.diff, self.scroll = not self.diff, 0
+            elif ch in ("j", curses.KEY_DOWN, curses.KEY_RIGHT):
+                self.step(1)
+            elif ch in ("k", curses.KEY_UP, curses.KEY_LEFT):
+                self.step(-1)
+            elif ch == "n":
+                self.next_pending()
+            elif ch == "g":
+                self.cur = None
+                self.step(1)
+            elif ch == "G":
+                self.cur = None
+                self.step(-1)
+            elif ch in (" ", curses.KEY_NPAGE):
+                self.scroll += max(1, self.scr.getmaxyx()[0] - 7)
+            elif ch in ("b", curses.KEY_PPAGE):
+                self.scroll = max(0, self.scroll - max(1, self.scr.getmaxyx()[0] - 7))
+
+
+def cmd_review(store, args):
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        args.status, args.json = None, False
+        return cmd_list(store, args)
+    locale.setlocale(locale.LC_ALL, "")
+    curses.wrapper(lambda scr: Review(scr, store).run())
+    print(summary(store.read()))
+    print(store.path)
+
+
+# ---------------------------------------------------------------- main
+
+def main():
+    p = argparse.ArgumentParser(prog="journeymaxx", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("-f", "--file", help="path to the .journeymaxx file (default: nearest one "
+                   "above the current directory, else the repo root)")
+    sub = p.add_subparsers(dest="cmd")
+
+    sub.add_parser("review", help="review journeys (the default)")
+
+    a = sub.add_parser("add", help="queue journeys from stdin (markdown split by ---, or JSON)")
+    a.add_argument("--title", help="add a single journey with this title; stdin is its body")
+    a.add_argument("--body")
+
+    r = sub.add_parser("revise", help="replace a journey's text (stdin) and put it back to pending")
+    r.add_argument("id", type=int)
+    r.add_argument("--title")
+    r.add_argument("--body")
+    r.add_argument("-m", "--message", help="note shown to the reviewer")
+
+    y = sub.add_parser("reply", help="leave a note on a journey; it does NOT go back to the reviewer")
+    y.add_argument("id", type=int)
+    y.add_argument("message")
+
+    q = sub.add_parser("ask", help="question, pushback or contradiction the reviewer must answer; "
+                       "back to pending")
+    q.add_argument("id", type=int)
+    q.add_argument("message")
+
+    fb = sub.add_parser("feedback", help="print reviewer activity not yet read, and mark it read")
+    fb.add_argument("--peek", action="store_true", help="do not mark it read")
+    fb.add_argument("--json", action="store_true")
+
+    w = sub.add_parser("wait", help="block until a comment, edit or rejection arrives (or nothing "
+                       "is pending), then print feedback")
+    w.add_argument("--timeout", type=int, default=0, help="seconds; exit 2 when it passes")
+    w.add_argument("--json", action="store_true")
+
+    ls = sub.add_parser("list", help="one line per journey")
+    ls.add_argument("--status", choices=STATUSES)
+    ls.add_argument("--json", action="store_true")
+
+    s = sub.add_parser("show", help="one journey with its thread")
+    s.add_argument("id", type=int)
+
+    x = sub.add_parser("export", help="journeys as markdown")
+    x.add_argument("--status", choices=STATUSES + ("all",), default="approved")
+
+    args = p.parse_args()
+    store = Store(find_file(args.file))
+    handler = {"add": cmd_add, "revise": cmd_revise, "reply": cmd_reply, "ask": cmd_ask, "feedback": cmd_feedback,
+               "wait": cmd_wait, "list": cmd_list, "show": cmd_show, "export": cmd_export,
+               "review": cmd_review, None: cmd_review}[args.cmd]
+    try:
+        handler(store, args)
+    except ValueError as e:
+        sys.exit(f"journeymaxx: {store.path} is not valid JSON ({e})")
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
