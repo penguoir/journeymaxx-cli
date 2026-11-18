@@ -1,0 +1,25 @@
+README.md
+  s_5279df542b1367::t_f3edd0c3e958aa 1-58
+install.sh
+  s_5279df542b1367::t_a829a40c13cb8b 1-9
+journeymaxx
+  s_5279df542b1367::t_2773e9c52290f2 1-864
+skill/SKILL.md
+  s_5279df542b1367::t_7f8ea01176cffb 1-65
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "fb45bc07857e1c2ace1243138852052b3337ca98",
+  "prompts": {},
+  "sessions": {
+    "s_5279df542b1367": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "8e42d436-4881-411a-a57d-f9d3fcefd948",
+        "model": "claude-fable-5-2"
+      },
+      "human_author": "Ori Marash <ori@framesports.ai>"
+    }
+  }
+}
