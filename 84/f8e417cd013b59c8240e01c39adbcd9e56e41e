@@ -1,0 +1,19 @@
+journeymaxx
+  s_d45eaeb59eb677::t_6a81356ec263f4 516-518,520-528,923-924,927-929,1198
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "84f8e417cd013b59c8240e01c39adbcd9e56e41e",
+  "prompts": {},
+  "sessions": {
+    "s_d45eaeb59eb677": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbbc9adf-1678-4d57-aaba-f9618126da4b",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ori Marash <ori@framesports.ai>"
+    }
+  }
+}
