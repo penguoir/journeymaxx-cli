@@ -1,0 +1,46 @@
+journeymaxx
+  s_d45eaeb59eb677::t_884613723bba5f 993-995
+  s_d45eaeb59eb677::t_6ad7a76ce8190d 392-467,469-474,476-669,1162
+  s_d45eaeb59eb677::t_04bbf838f15fef 729-734
+  s_d45eaeb59eb677::t_cd32f3a429dc4a 1016
+  s_d45eaeb59eb677::t_509a651b2c1b63 1023,1025
+  s_d45eaeb59eb677::t_1d8cf449c489b3 804-865
+  s_d45eaeb59eb677::t_dd52306e0aaf15 1046
+  s_d45eaeb59eb677::t_d00d567d040709 31,33-36,38
+  s_d45eaeb59eb677::t_52f6c7dcfc7a08 1069-1075
+  s_d45eaeb59eb677::t_07c77b83a23111 1114-1116
+  s_d45eaeb59eb677::t_0e8abc0adc79ff 6-7
+  s_d45eaeb59eb677::t_58a303bf56b4bf 475
+  s_d45eaeb59eb677::t_ff0e0784c7e98d 468
+  s_d45eaeb59eb677::t_16952f2d52f0e5 1131-1132
+  s_d45eaeb59eb677::t_420bccb7535eaf 792,796
+  s_e31ee9c000d42b::t_b9b25176cb4ec3 1159-1161,1163-1168,1228-1230,1235
+README.md
+  s_d45eaeb59eb677::t_1523b38ae61b80 10-11,29,38-57,69
+skill/SKILL.md
+  s_d45eaeb59eb677::t_c4bc2f0a8176d6 10,61-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "ba80a5fd7ff3e6d3c4c513af8c7e9319f5a05fe5",
+  "prompts": {},
+  "sessions": {
+    "s_d45eaeb59eb677": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbbc9adf-1678-4d57-aaba-f9618126da4b",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ori Marash <ori@framesports.ai>"
+    },
+    "s_e31ee9c000d42b": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "0341bd46-8f36-491b-84e2-4d45f9b64e5b",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ori Marash <ori@framesports.ai>"
+    }
+  }
+}
