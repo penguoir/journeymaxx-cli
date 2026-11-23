@@ -3,9 +3,11 @@
 
 Claude writes journeys into a .journeymaxx file (JSON); you run `journeymaxx`
 next to the Claude session and go through them: enter approves, c sends Claude
-a message, ctrl+g edits in vim, r rejects.
+a message, v says it out loud (ElevenLabs speech-to-text), ctrl+g edits in vim,
+r rejects.
 
   You:     journeymaxx                      review (TUI)
+           journeymaxx talk                 review by voice: it reads each one out, you answer
   Claude:  journeymaxx add < journeys.md    queue journeys (markdown split by ---, or JSON)
            journeymaxx wait                 block until there is feedback, then print it
            journeymaxx feedback             print feedback not yet read
@@ -27,8 +29,14 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 FILENAME = ".journeymaxx"
 STATUSES = ("pending", "approved", "changes_requested", "rejected")
@@ -382,6 +390,546 @@ def cmd_export(store, args):
     print("\n\n".join(f"**{j['title']}**\n\n{j['body']}".strip() for j in js))
 
 
+# ---------------------------------------------------------------- voice (ElevenLabs)
+
+KEY_FILE = os.path.expanduser("~/.config/journeymaxx/elevenlabs_api_key")
+API = "https://api.elevenlabs.io/v1"
+STT_MODEL = os.environ.get("JOURNEYMAXX_STT_MODEL", "scribe_v2")
+TTS = os.environ.get("JOURNEYMAXX_TTS", "free")  # free: the browser's voice (or `say`); elevenlabs
+TTS_MODEL = os.environ.get("JOURNEYMAXX_TTS_MODEL", "eleven_flash_v2_5")
+VOICE_ID = os.environ.get("JOURNEYMAXX_VOICE", "onwK4e9ZLuTAKqWW03F9")  # Daniel, British
+SPEED = float(os.environ.get("JOURNEYMAXX_SPEED", "1.1"))
+PAUSE = float(os.environ.get("JOURNEYMAXX_PAUSE", "1.3"))  # seconds of quiet that end an answer
+MIC_PORT = int(os.environ.get("JOURNEYMAXX_MIC_PORT", "8737"))
+TTS_CACHE = os.path.expanduser("~/.cache/journeymaxx/tts")
+
+
+class VoiceError(Exception):
+    pass
+
+
+def api_key():
+    key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+    if not key:
+        try:
+            with open(KEY_FILE, encoding="utf-8") as f:
+                key = f.read().strip()
+        except FileNotFoundError:
+            pass
+    if not key:
+        raise VoiceError(f"no ElevenLabs key: set ELEVENLABS_API_KEY or put it in {KEY_FILE}")
+    return key
+
+
+def eleven(path, data, headers, timeout):
+    req = urllib.request.Request(API + path, data=data, method="POST",
+                                 headers={"xi-api-key": api_key(), **headers})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.read()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        try:
+            d = json.loads(detail)["detail"]
+            detail = d.get("message", d) if isinstance(d, dict) else d
+        except (ValueError, KeyError, TypeError):
+            pass
+        raise VoiceError(f"ElevenLabs {e.code}: {str(detail)[:160]}")
+    except (urllib.error.URLError, OSError) as e:
+        raise VoiceError(f"could not reach ElevenLabs: {e}")
+
+
+def transcribe(audio, content_type="audio/wav"):
+    """Speech to text with ElevenLabs Scribe. Returns the transcript."""
+    ext = {"webm": "webm", "ogg": "ogg", "mp4": "mp4", "mpeg": "mp3", "wav": "wav"}
+    name = "speech." + next((v for k, v in ext.items() if k in content_type), "wav")
+    boundary = uuid.uuid4().hex
+    parts = []
+    for field, value in (("model_id", STT_MODEL), ("tag_audio_events", "false")):
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"\r\n\r\n{value}\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
+                 f"Content-Type: {content_type}\r\n\r\n".encode() + audio + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    body = eleven("/speech-to-text", b"".join(parts),
+                  {"Content-Type": f"multipart/form-data; boundary={boundary}"}, 90)
+    return json.loads(body).get("text", "").strip()
+
+
+class Speech:
+    """Text to speech. By default None: the mic reads with a free voice (the browser's, `say` on
+    macOS, espeak on Linux). With JOURNEYMAXX_TTS=elevenlabs, ElevenLabs audio cached on disk,
+    falling back to the free voice when it fails."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.failed = ""  # set once ElevenLabs refuses; the rest of the session uses the fallback
+        self.blip = ""
+
+    def path(self, text):
+        import hashlib
+        h = hashlib.sha1(f"{VOICE_ID}|{TTS_MODEL}|{SPEED}|{text}".encode()).hexdigest()
+        return os.path.join(TTS_CACHE, h + ".mp3")
+
+    def audio(self, text):
+        if TTS != "elevenlabs":
+            return None
+        p = self.path(text)
+        if os.path.exists(p):
+            return p
+        if self.failed:
+            return None
+        for attempt in range(2):
+            try:
+                mp3 = eleven(f"/text-to-speech/{VOICE_ID}?output_format=mp3_44100_64",
+                             json.dumps({"text": text, "model_id": TTS_MODEL,
+                                         "voice_settings": {"speed": SPEED}}).encode(),
+                             {"Content-Type": "application/json"}, 60)
+                break
+            except VoiceError as e:
+                msg = str(e)
+                if re.search(r"ElevenLabs (401|402|403)|quota|credits", msg, re.I):
+                    with self.lock:  # out of quota or a bad key: stop asking for this session
+                        self.failed = self.failed or msg
+                    return None
+                if attempt:  # busy or a blip: the free voice reads this one sentence
+                    self.blip = msg
+                    return None
+                time.sleep(0.6)
+        os.makedirs(TTS_CACHE, exist_ok=True)
+        tmp = f"{p}.{os.getpid()}.{threading.get_ident()}"
+        with open(tmp, "wb") as f:
+            f.write(mp3)
+        os.replace(tmp, p)
+        return p
+
+    def prefetch(self, *texts):
+        def run():
+            for t in texts:
+                self.audio(t)
+        threading.Thread(target=run, daemon=True).start()
+
+
+SPEECH = Speech()
+
+
+def speakable(md):
+    """Light markdown to sentences a voice can read."""
+    out = []
+    for line in md.splitlines():
+        line = re.sub(r"^\s*([-*•]|\d+[.)]|#+)\s+", "", line)
+        line = line.replace("**", "").replace("`", "").strip()
+        if line:
+            out.append(line if line[-1] in ".!?:;" else line + ".")
+    return " ".join(out)
+
+
+def which(cmd):
+    return subprocess.call(["sh", "-c", f"command -v {cmd}"], stdout=subprocess.DEVNULL) == 0
+
+
+class LocalMic:
+    """This machine's microphone and speakers: ffmpeg records, afplay/ffplay play."""
+    kind = "local"
+
+    def __init__(self):
+        self.proc, self.path, self.player = None, None, None
+        self.requested = self.stop_requested = self.heard = False
+
+    def ready(self):
+        return True
+
+    def hint(self):
+        return ""
+
+    def start(self, auto=False):
+        if sys.platform == "darwin":
+            src = ["-f", "avfoundation", "-i", os.environ.get("JOURNEYMAXX_MIC_DEVICE", ":0")]
+        else:
+            src = ["-f", "pulse", "-i", os.environ.get("JOURNEYMAXX_MIC_DEVICE", "default")]
+        if os.environ.get("JOURNEYMAXX_MIC_INPUT"):  # any ffmpeg input, e.g. "-re -i test.wav"
+            src = shlex.split(os.environ["JOURNEYMAXX_MIC_INPUT"])
+        vad = ["-af", f"silencedetect=noise=-35dB:d={PAUSE}"] if auto else []
+        fd, self.path = tempfile.mkstemp(prefix="journeymaxx-", suffix=".wav")
+        os.close(fd)
+        self.stop_requested = self.heard = False
+        self.err = []
+        try:
+            self.proc = subprocess.Popen(
+                ["ffmpeg", "-hide_banner", "-nostats", "-loglevel", "info" if auto else "error", "-y",
+                 *src, *vad, "-ac", "1", "-ar", "16000", self.path],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except OSError as e:
+            os.unlink(self.path)
+            raise VoiceError(f"could not start ffmpeg: {e}")
+        threading.Thread(target=self.read_stderr, args=(self.proc,), daemon=True).start()
+        time.sleep(0.3)
+        if self.proc.poll() is not None:
+            os.unlink(self.path)
+            time.sleep(0.1)
+            raise VoiceError("no microphone: " + (self.err[-1] if self.err else "ffmpeg exited") +
+                             " (JOURNEYMAXX_MIC=browser records in a browser instead)")
+
+    def read_stderr(self, proc):
+        for raw in proc.stderr:
+            line = raw.decode("utf-8", "replace").strip()
+            self.err.append(line)
+            if "silence_end" in line:
+                self.heard = True
+            m = re.search(r"silence_start: ([\d.]+)", line)
+            if m and (self.heard or float(m.group(1)) > 0.4):  # quiet after talking
+                self.heard = self.stop_requested = True
+
+    def stop(self):
+        try:
+            self.proc.stdin.write(b"q")
+            self.proc.stdin.close()
+            self.proc.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            self.proc.kill()
+            self.proc.wait()
+        try:
+            with open(self.path, "rb") as f:
+                return f.read(), "audio/wav"
+        finally:
+            os.unlink(self.path)
+
+    def cancel(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        if self.path and os.path.exists(self.path):
+            os.unlink(self.path)
+
+    def say(self, text):
+        self.hush()
+        p = SPEECH.audio(text)
+        if p:
+            cmd = ["afplay", p] if sys.platform == "darwin" else \
+                ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", p]
+        elif sys.platform == "darwin":
+            cmd = ["say", "-r", "200", text]
+        elif which("espeak-ng") or which("espeak"):
+            cmd = ["espeak-ng" if which("espeak-ng") else "espeak", text]
+        else:
+            return
+        try:
+            self.player = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL)
+        except OSError as e:
+            raise VoiceError(f"could not play audio: {e}")
+
+    def speaking(self):
+        return self.player is not None and self.player.poll() is None
+
+    def hush(self):
+        if self.speaking():
+            self.player.kill()
+            self.player.wait()
+
+
+MIC_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>journeymaxx mic</title>
+<style>
+body{font:16px system-ui,sans-serif;margin:0;min-height:100vh;display:flex;align-items:center;
+justify-content:center;background:#111;color:#eee;text-align:center}
+button{font:inherit;font-size:20px;padding:28px 40px;border-radius:999px;border:0;background:#333;
+color:#eee;cursor:pointer;min-width:240px}
+.rec button{background:#d33}.play button{background:#2a6}
+.dim{color:#888;font-size:14px;margin-top:20px;max-width:30em}
+</style></head><body><div><button id="b">Enable microphone</button>
+<p class="dim" id="s">Keep this tab open. In journeymaxx, t talks you through the queue and v speaks one message.</p></div>
+<script>
+const PAUSE=__PAUSE__;
+const b=document.getElementById('b'),s=document.getElementById('s');
+let v=0,seq=0,stream=null,mr=null,chunks=[],enabled=false,ctx=null,vad=null,playing=0,audio=null;
+const say=t=>{s.textContent=t};
+const post=u=>fetch(u,{method:'POST'}).catch(()=>{});
+const idle=()=>{document.body.className='';b.textContent=enabled?'Talk':'Enable microphone';
+  if(enabled)say('Ready. In journeymaxx, t talks you through the queue and v speaks one message.')};
+if(!window.isSecureContext) say('The microphone only works on http://localhost. Forward the port (ssh -L '+location.port+':localhost:'+location.port+') and open http://localhost:'+location.port);
+async function mic(){return navigator.mediaDevices.getUserMedia({audio:{echoCancellation:true,noiseSuppression:true}})}
+b.onclick=async()=>{
+  if(!enabled){try{(await mic()).getTracks().forEach(t=>t.stop());ctx=new AudioContext();await ctx.resume();
+    enabled=true;idle()}catch(e){say('Microphone blocked: '+e.message)}return}
+  post('/toggle');
+};
+function beep(){if(!ctx)return;const o=ctx.createOscillator(),g=ctx.createGain();o.frequency.value=880;
+  g.gain.value=0.12;o.connect(g);g.connect(ctx.destination);o.start();o.stop(ctx.currentTime+0.09)}
+function listenFor(n){ // voice activity: report the first speech, then the pause that ends it
+  const src=ctx.createMediaStreamSource(stream),proc=ctx.createScriptProcessor(2048,1,1),g=ctx.createGain();
+  g.gain.value=0;src.connect(proc);proc.connect(g);g.connect(ctx.destination);
+  const dt=2048/ctx.sampleRate*1000;let floor=0.004,talking=false,loud=0,quiet=0,t=0,done=false;
+  proc.onaudioprocess=e=>{t+=dt;if(t<200||done)return;const d=e.inputBuffer.getChannelData(0);let sum=0;
+    for(let i=0;i<d.length;i++)sum+=d[i]*d[i];const rms=Math.sqrt(sum/d.length),thr=Math.max(0.012,floor*3);
+    if(rms>thr){loud+=dt;quiet=0;if(!talking&&loud>150){talking=true;post('/heard?seq='+n)}}
+    else{quiet+=dt;if(!talking){loud=0;floor=floor*0.9+rms*0.1}}
+    if(talking&&quiet>PAUSE*1000){done=true;post('/silence?seq='+n)}};
+  vad={src,proc,g};
+}
+async function start(n,auto){
+  chunks=[];
+  try{stream=await mic()}catch(e){
+    await fetch('/audio?seq='+n+'&error='+encodeURIComponent(e.message),{method:'POST'});return}
+  enabled=true;if(!ctx)ctx=new AudioContext();ctx.resume();
+  const type=['audio/webm;codecs=opus','audio/webm','audio/mp4'].find(t=>MediaRecorder.isTypeSupported(t));
+  mr=new MediaRecorder(stream,type?{mimeType:type}:{});
+  mr.ondataavailable=e=>chunks.push(e.data);
+  mr.onstop=async()=>{stream.getTracks().forEach(t=>t.stop());
+    const blob=new Blob(chunks,{type:mr.mimeType});
+    await fetch('/audio?seq='+n,{method:'POST',headers:{'Content-Type':mr.mimeType||'audio/webm'},body:blob})};
+  beep();mr.start();if(auto)listenFor(n);
+  document.body.className='rec';b.textContent='Listening… (done)';
+  say(auto?'Listening. Stop talking and it sends.':'Listening. Enter in journeymaxx to stop.');
+}
+function stop(){if(vad){vad.src.disconnect();vad.proc.disconnect();vad.g.disconnect();vad=null}
+  if(mr&&mr.state!=='inactive')mr.stop();idle()}
+function play(p){
+  playing=p.n;document.body.className='play';b.textContent='Speaking… (answer now)';say(p.text);
+  const end=()=>{if(playing===p.n){playing=0;post('/played?n='+p.n);idle()}};
+  const speak=()=>{ // one sentence at a time: Chrome's voices stop partway through long text
+    const vs=speechSynthesis.getVoices(),voice=vs.find(x=>x.lang==='en-GB')||vs.find(x=>/^en/.test(x.lang))||null;
+    const parts=p.text.match(/[^.!?:]+[.!?:]*/g)||[p.text];speechSynthesis.cancel();
+    parts.forEach((t,i)=>{const u=new SpeechSynthesisUtterance(t.trim());u.voice=voice;u.rate=1.15;
+      if(i===parts.length-1){u.onend=end;u.onerror=end}speechSynthesis.speak(u)})};
+  if(p.audio){audio=new Audio('/tts?n='+p.n);audio.onended=end;audio.onerror=speak;audio.play().catch(speak)}
+  else speak();
+}
+function hush(){if(audio){audio.onended=null;audio.pause();audio=null}speechSynthesis.cancel();playing=0;idle()}
+(async()=>{for(;;){try{
+  const r=await(await fetch('/poll?v='+v)).json();v=r.v;
+  if(r.recording&&r.seq!==seq){seq=r.seq;start(seq,r.auto)}
+  else if(!r.recording&&mr&&mr.state==='recording')stop();
+  if(r.play&&r.play.n!==playing)play(r.play);else if(!r.play&&playing)hush();
+}catch(e){say('journeymaxx is not running. Start it and reload.');await new Promise(z=>setTimeout(z,3000))}}})();
+</script></body></html>"""
+
+
+class BrowserMic:
+    """For an SSH session with no sound card: a page on localhost records and plays in your browser."""
+    kind = "browser"
+
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.v, self.seq, self.recording, self.auto, self.last_seen = 0, 0, False, False, 0.0
+        self.play, self.play_n, self.played_n, self.tts = None, 0, 0, {}
+        self.audio = {}
+        self.requested = self.stop_requested = self.heard = False
+        for port in range(MIC_PORT, MIC_PORT + 10):
+            try:
+                self.server = ThreadingHTTPServer(("127.0.0.1", port), self.handler(self))
+                break
+            except OSError:
+                continue
+        else:
+            raise VoiceError(f"ports {MIC_PORT}-{MIC_PORT + 9} are all in use")
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        self.url = f"http://localhost:{self.port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def bump(self):  # call holding cv: wakes the page's long poll
+        self.v += 1
+        self.cv.notify_all()
+
+    @staticmethod
+    def handler(mic):
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # stderr would draw over the TUI
+                pass
+
+            def send(self, code, body, ctype="application/json"):
+                body = body.encode() if isinstance(body, str) else body
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def query(self):
+                return dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.path).query))
+
+            def local_origin(self):
+                origin = self.headers.get("Origin")
+                return not origin or urllib.parse.urlparse(origin).hostname in ("localhost", "127.0.0.1")
+
+            def do_GET(self):
+                route, q = urllib.parse.urlparse(self.path).path, self.query()
+                if route == "/":
+                    return self.send(200, MIC_PAGE.replace("__PAUSE__", str(PAUSE)), "text/html; charset=utf-8")
+                if route == "/tts":
+                    data = mic.tts.get(int(q.get("n", 0) or 0))
+                    return self.send(200, data, "audio/mpeg") if data else self.send(404, "{}")
+                if route == "/poll":
+                    have = int(q.get("v", -1) or -1)
+                    with mic.cv:
+                        mic.last_seen = time.time()
+                        mic.cv.wait_for(lambda: mic.v != have, timeout=20)
+                        mic.last_seen = time.time()
+                        play = mic.play and {k: mic.play[k] for k in ("n", "text", "audio")}
+                        state = {"v": mic.v, "seq": mic.seq, "recording": mic.recording,
+                                 "auto": mic.auto, "play": play}
+                    return self.send(200, json.dumps(state))
+                self.send(404, "{}")
+
+            def do_POST(self):
+                if not self.local_origin():
+                    return self.send(403, "{}")
+                route, q = urllib.parse.urlparse(self.path).path, self.query()
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                n = int(q.get("seq", q.get("n", 0)) or 0)
+                with mic.cv:
+                    if route == "/toggle":
+                        if mic.recording:
+                            mic.stop_requested = True
+                        elif mic.play:
+                            mic.played_n = mic.play_n  # "answer now" while it is speaking
+                        else:
+                            mic.requested = True
+                    elif route == "/heard" and n == mic.seq:
+                        mic.heard = True
+                    elif route == "/silence" and n == mic.seq:
+                        mic.stop_requested = True
+                    elif route == "/played":
+                        mic.played_n = max(mic.played_n, n)
+                    elif route == "/audio":
+                        mic.audio[n] = (body, self.headers.get("Content-Type", "audio/webm"), q.get("error"))
+                    else:
+                        return self.send(404, "{}")
+                    mic.cv.notify_all()
+                self.send(200, "{}")
+        return H
+
+    def ready(self):
+        return time.time() - self.last_seen < 30
+
+    def hint(self):
+        return (f"open {self.url} in a browser to talk (over SSH forward it first: "
+                f"ssh -L {self.port}:localhost:{self.port} <this host>)")
+
+    def start(self, auto=False):
+        if not self.ready():
+            raise VoiceError(self.hint())
+        with self.cv:
+            self.seq += 1
+            self.recording, self.auto = True, auto
+            self.requested = self.stop_requested = self.heard = False
+            self.bump()
+
+    def stop(self):
+        with self.cv:
+            self.recording = False
+            self.bump()
+            n = self.seq
+            if not self.cv.wait_for(lambda: n in self.audio, timeout=20):
+                raise VoiceError("the browser did not send the recording")
+            audio, ctype, err = self.audio.pop(n)
+        if err:
+            raise VoiceError(f"browser microphone: {err}")
+        return audio, ctype
+
+    def cancel(self):
+        with self.cv:
+            self.recording = self.stop_requested = False
+            self.audio.clear()
+            self.bump()
+
+    def say(self, text):
+        if not self.ready():
+            raise VoiceError(self.hint())
+        p = SPEECH.audio(text)
+        data = None
+        if p:
+            with open(p, "rb") as f:
+                data = f.read()
+        with self.cv:
+            self.play_n += 1
+            self.tts = {self.play_n: data} if data else {}
+            self.play = {"n": self.play_n, "text": text, "audio": bool(data)}
+            self.bump()
+
+    def speaking(self):
+        with self.cv:
+            if self.play and self.played_n >= self.play["n"]:
+                self.play = None
+                self.bump()
+            return self.play is not None
+
+    def hush(self):
+        with self.cv:
+            if self.play:
+                self.played_n, self.play = self.play["n"], None
+                self.bump()
+
+
+def make_mic():
+    """JOURNEYMAXX_MIC=local|browser; by default the browser over SSH, else this machine."""
+    choice = os.environ.get("JOURNEYMAXX_MIC", "").lower()
+    if not choice:
+        over_ssh = os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY")
+        choice = "browser" if over_ssh or not which("ffmpeg") else "local"
+    return BrowserMic() if choice == "browser" else LocalMic()
+
+
+# ---------------------------------------------------------------- talking through the queue
+
+APPROVE_WORDS = {"yes", "yeah", "yep", "yup", "good", "great", "perfect", "fine", "approve", "approved",
+                 "ok", "okay", "nice", "correct", "lgtm", "cool", "brilliant", "lovely", "excellent",
+                 "agreed", "accept", "accepted", "sure", "spot", "love", "ship", "happy", "sounds"}
+APPROVE_FILLER = {"looks", "look", "that", "that's", "thats", "it", "it's", "its", "this", "is", "all", "very",
+                  "really", "pretty", "on", "with", "one", "me", "to", "fine", "please", "a", "the", "good"}
+REJECT_WORDS = {"no", "nope", "nah", "reject", "rejected", "drop", "bin", "kill", "scrap", "delete", "remove",
+                "cut", "lose", "rid"}
+REJECT_FILLER = {"it", "this", "that", "one", "get", "rid", "of", "please", "the"}
+SKIP = {"skip", "skip it", "skip this", "next", "next one", "later", "come back to it",
+        "come back to that", "pass", "not sure"}
+REPEAT = {"repeat", "again", "say again", "say that again", "read it again", "what", "pardon",
+          "sorry", "come again", "repeat that", "what was that"}
+UNDO = {"undo", "go back", "back", "previous", "wait go back", "undo that"}
+STOP = {"stop", "pause", "that's all", "thats all", "that's it for now", "exit", "quit", "stop talking"}
+FILLERS = {"um", "uh", "erm", "er", "hmm", "so", "oh", "ah", "right", "okay so"}
+TRAILING = {"thanks", "thank", "you", "please", "cheers", "mate"}
+
+
+def intent(text):
+    """What a spoken answer means: (action, message). Short yes/no answers decide; anything
+    with more in it goes to Claude as a comment."""
+    words = re.sub(r"[^a-z0-9' ]+", " ", text.lower()).split()
+    while len(words) > 1 and words[0] in FILLERS:
+        words.pop(0)
+    while len(words) > 1 and words[-1] in TRAILING:
+        words.pop()
+    p, w = " ".join(words), set(words)
+    for name, phrases in (("skip", SKIP), ("repeat", REPEAT), ("undo", UNDO), ("stop", STOP)):
+        if p in phrases:
+            return name, None
+    if w & APPROVE_WORDS and not w & REJECT_WORDS and w <= APPROVE_WORDS | APPROVE_FILLER:
+        return "approve", None
+    if w & REJECT_WORDS and not w & APPROVE_WORDS and w <= REJECT_WORDS | REJECT_FILLER:
+        return "reject", None
+    m = re.match(r"(?i)^\W*(reject|drop|bin|scrap|kill)( (it|this|that))?\b[\s,.:;-]*"
+                 r"((because|as|since)\b)?[\s,]*(.+)$", text.strip())
+    if m and m.group(6).strip():
+        return "reject", m.group(6).strip()
+    return "comment", text.strip()
+
+
+def script(j):
+    """What talk mode says to put a journey in front of you."""
+    last = next((e for e in reversed(j["history"]) if e["by"] == "claude"
+                 and e["action"] in ("revised", "question")), None)
+    body = speakable(j["body"])
+    if last and last["action"] == "question":
+        return f"Claude asks about number {j['id']}, {j['title']}: {last.get('message', '')}"
+    if last and last["action"] == "revised":
+        note = f" Claude says: {last['message'].rstrip('.')}." if last.get("message") else ""
+        return f"Number {j['id']}, revised.{note} {j['title']}. {body}"
+    return f"Number {j['id']}. {j['title']}. {body}"
+
+
+ACKS = {"approve": "Approved.", "reject": "Rejected.", "comment": "Sent to Claude.", "skip": "Skipped."}
+
+
 # ---------------------------------------------------------------- TUI
 
 def md_lines(text, width, base=0):
@@ -441,6 +989,16 @@ class Review:
         self.diff = False
         self.flash = ""
         self.color = {}
+        self.mic = None
+        self.mic_error = ""
+        self.talking = False
+        self.said_fallback = False
+        self.voice_failed = False
+        self.autotalk = False
+        try:
+            self.mic = make_mic()
+        except VoiceError as e:
+            self.mic_error = str(e)
 
     # -- state
 
@@ -498,17 +1056,211 @@ class Review:
             self.flash = f"#{j['id']} approved"
         self.next_pending()
 
-    def comment(self):
+    def comment(self, initial=""):
         j = self.journey()
         if j is None:
             return
-        text = self.prompt(f"Message to Claude about #{j['id']}")
+        text = self.prompt(f"Message to Claude about #{j['id']}", initial=initial)
         if not text:
             return
         self.change(lambda j: (set_status(j, "changes_requested"),
                                event(j, "reviewer", "comment", message=text)))
         self.flash = f"#{j['id']} sent to Claude"
         self.next_pending()
+
+    def listen(self, auto=False):
+        """Record and transcribe. auto: stop on a pause instead of enter.
+        Returns the text, "" when nothing came of it (see self.flash), None when cancelled."""
+        self.voice_failed = False
+        if self.mic is None:
+            self.flash, self.voice_failed = self.mic_error, True
+            return ""
+        try:
+            self.mic.start(auto=auto)
+        except VoiceError as e:
+            self.mic.requested = False
+            self.flash, self.voice_failed = str(e), True
+            return ""
+        started = time.time()
+        keys = ("pause to answer · enter answer now · esc stop talking" if auto
+                else "enter stop and send to the message box · esc cancel")
+        self.scr.timeout(150)
+        try:
+            while True:
+                waited = time.time() - started
+                self.status_line(f"● Listening {int(waited)}s", keys, "rejected")
+                try:
+                    ch = self.scr.get_wch()
+                except curses.error:
+                    ch = None
+                except KeyboardInterrupt:
+                    ch = "\x1b"
+                if ch == "\x1b":
+                    self.mic.cancel()
+                    self.flash = "recording cancelled"
+                    return None
+                if ch in ("\n", "\r", curses.KEY_ENTER, " ") or (ch == "v" and not auto) \
+                        or self.mic.stop_requested or waited > 120:
+                    break
+                if auto and not self.mic.heard and waited > 20:
+                    self.mic.cancel()  # nobody spoke; start again rather than pay to transcribe silence
+                    return ""
+            self.status_line("Transcribing…", "", "claude")
+            audio, ctype = self.mic.stop()
+            text = transcribe(audio, ctype)
+        except VoiceError as e:
+            self.mic.cancel()
+            self.flash, self.voice_failed = str(e), True
+            return ""
+        finally:
+            self.scr.timeout(400)
+        if not text:
+            self.flash = "did not catch anything"
+        return text
+
+    def voice(self):
+        if self.journey() is None:
+            if self.mic:
+                self.mic.requested = False
+            return
+        text = self.listen()
+        if text:
+            self.comment(initial=text)
+
+    def say(self, text):
+        """Speak, keeping the screen alive. Returns "done", "skip" (answer now) or "stop"."""
+        try:
+            self.mic.say(text)
+        except VoiceError as e:
+            self.flash = str(e)
+            return "done"
+        if SPEECH.failed and not self.said_fallback:
+            self.said_fallback = True
+            self.flash = f"ElevenLabs voice unavailable, using the free one ({SPEECH.failed})"
+        deadline = time.time() + 10 + len(text) / 8
+        self.scr.timeout(120)
+        try:
+            while self.mic.speaking() and time.time() < deadline:
+                self.status_line("▶ Speaking", "space answer now · esc stop talking", "claude")
+                try:
+                    ch = self.scr.get_wch()
+                except curses.error:
+                    continue
+                except KeyboardInterrupt:
+                    ch = "\x1b"
+                if ch == "\x1b":
+                    self.mic.hush()
+                    return "stop"
+                if ch in (" ", "\n", "\r", curses.KEY_ENTER):
+                    self.mic.hush()
+                    return "skip"
+            self.mic.hush()
+            return "done"
+        finally:
+            self.scr.timeout(400)
+
+    def talk(self):
+        """Hands-free: read each pending journey out, listen, act on the answer, move on."""
+        if self.mic is None:
+            self.flash = self.mic_error
+            return
+        if not self.mic.ready():
+            self.flash = self.mic.hint()
+            return
+        self.talking = True
+        SPEECH.prefetch(*ACKS.values(), "Undone.", "All caught up. I'll read out what Claude sends back.")
+        spoken, last, failures, caught_up = None, None, 0, False
+        n = counts(self.data)["pending"]
+        intro = f"{n} to review. " if n > 1 else ""
+        try:
+            while True:
+                if self.store.mtime() != self.mtime:
+                    self.reload()
+                j = self.journey()
+                if j is None or j["status"] != "pending":
+                    self.next_pending()
+                    j = self.journey()
+                if j is None:
+                    if not caught_up:
+                        caught_up = True
+                        if self.say("All caught up. I'll read out what Claude sends back.") == "stop":
+                            return
+                    self.status_line("All caught up · waiting for Claude", "esc stop talking", "claude")
+                    try:
+                        if self.scr.get_wch() == "\x1b":
+                            return
+                    except curses.error:
+                        pass
+                    continue
+                caught_up = False
+                if spoken != j["id"]:
+                    spoken = j["id"]
+                    if self.say(intro + script(j)) == "stop":
+                        return
+                    intro = ""
+                    nxt = self.peek_next(j["id"])
+                    if nxt:
+                        SPEECH.prefetch(script(nxt))
+                text = self.listen(auto=True)
+                if text is None:
+                    return
+                if not text:
+                    failures = failures + 1 if self.voice_failed else 0
+                    if failures >= 2:
+                        return
+                    continue
+                failures = 0
+                action, msg = intent(text)
+                self.flash = f"heard: {text}"
+                if action == "stop":
+                    return
+                if action == "repeat":
+                    spoken = None
+                    continue
+                if action == "undo":
+                    if last is None:
+                        self.say("Nothing to undo.")
+                        continue
+                    self.goto(last)
+                    self.change(lambda j: (set_status(j, "pending"), event(j, "reviewer", "reopened")))
+                    last, spoken = None, None
+                    if self.say("Undone.") == "stop":
+                        return
+                    continue
+                if action == "approve":
+                    self.change(lambda j: (set_status(j, "approved"), event(j, "reviewer", "approved")))
+                elif action == "reject":
+                    self.change(lambda j: (set_status(j, "rejected"),
+                                           event(j, "reviewer", "rejected", message=msg)))
+                elif action == "comment":
+                    self.change(lambda j: (set_status(j, "changes_requested"),
+                                           event(j, "reviewer", "comment", message=msg)))
+                last = j["id"] if action != "skip" else last
+                self.next_pending()
+                spoken = None
+                if self.say(ACKS[action]) == "stop":
+                    return
+        finally:
+            self.talking = False
+            if self.mic:
+                self.mic.hush()
+            self.flash = "stopped talking · t to start again"
+
+    def peek_next(self, jid):
+        js = self.data["journeys"]
+        idx = next((i for i, j in enumerate(js) if j["id"] == jid), -1)
+        return next((j for j in js[idx + 1:] + js[:idx + 1]
+                     if j["status"] == "pending" and j["id"] != jid), None)
+
+    def status_line(self, msg, keys, color):
+        self.draw()
+        h, _ = self.scr.getmaxyx()
+        for y in (h - 2, h - 1):
+            self.scr.move(y, 0)
+            self.scr.clrtoeol()
+        self.put(h - 2, 2, msg, self.color.get(color, 0) | curses.A_BOLD)
+        self.put(h - 1, 1, keys, curses.A_DIM)
+        self.scr.refresh()
 
     def reject(self):
         j = self.journey()
@@ -637,6 +1389,9 @@ class Review:
         self.put(0, 1, "journeymaxx", curses.A_BOLD)
         self.put(0, 14, summary(self.data), curses.A_DIM)
         self.put(0, max(14, w - len(pos) - 2), pos, curses.A_DIM)
+        if self.mic and self.mic.kind == "browser":
+            mic = "mic ready" if self.mic.ready() else f"mic: open {self.mic.url}"
+            self.put(1, max(14, w - len(mic) - 2), mic, curses.A_DIM)
 
         keys = "↑↓ move · q quit"
         if j is None:
@@ -657,16 +1412,16 @@ class Review:
                     x += len(text)
             if self.scroll + avail < len(rows):
                 self.put(h - 3, 2, "▼ more (space)", curses.A_DIM)
-            keys = ("enter approve · c message Claude · ^G edit · r reject · u undo"
+            keys = ("enter approve · c message Claude · t talk it through · v speak · ^G edit · r reject · u undo"
                     + (" · d diff" if has_prev else "") + " · ↑↓ move · n next pending · q quit")
         if self.flash:
             self.put(h - 2, 2, self.flash, self.color.get("approved", 0))
         self.put(h - 1, 1, keys, curses.A_DIM)
         scr.refresh()
 
-    def prompt(self, label, allow_empty=False):
+    def prompt(self, label, allow_empty=False, initial=""):
         """One-field input at the bottom. Returns the text, or None when cancelled."""
-        buf = ""
+        buf = initial
         self.scr.timeout(-1)
         curses.curs_set(1)
         try:
@@ -687,7 +1442,7 @@ class Review:
                     self.put(top + 1 + n, 1, "> " if n == 0 else "  ", curses.A_DIM)
                     self.put(top + 1 + n, 3, line.replace("█", ""))
                 last = lines[-1].replace("█", "")
-                self.put(h - 1, 1, "enter send · esc cancel · ^G write in editor", curses.A_DIM)
+                self.put(h - 1, 1, "enter send · esc cancel · ^R speak · ^G write in editor", curses.A_DIM)
                 try:
                     self.scr.move(top + len(lines), min(w - 2, 3 + len(last)))
                 except curses.error:
@@ -710,6 +1465,13 @@ class Review:
                     edited = self.editor(buf)
                     if edited is not None:
                         buf = edited.strip()
+                elif ch == "\x12":
+                    curses.curs_set(0)
+                    said = self.listen()
+                    self.scr.timeout(-1)
+                    curses.curs_set(1)
+                    if said:
+                        buf = (buf.rstrip() + " " + said).strip()
                 elif ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
                     buf = buf[:-1]
                 elif ch == "\x15":
@@ -748,6 +1510,13 @@ class Review:
                 self.cur = None
             if self.cur is None:
                 self.next_pending()  # jump to new work as soon as Claude adds it
+            if self.autotalk and self.mic and self.mic.ready():
+                self.autotalk = False
+                self.talk()
+                continue
+            if self.mic and self.mic.requested:  # "Talk" pressed on the mic page
+                self.voice()
+                continue
             self.draw()
             try:
                 ch = self.scr.get_wch()
@@ -762,6 +1531,10 @@ class Review:
                 self.approve()
             elif ch in ("c", "C"):
                 self.comment()
+            elif ch in ("v", "V"):
+                self.voice()
+            elif ch in ("t", "T"):
+                self.talk()
             elif ch in ("\x07", "e"):
                 self.edit()
             elif ch == "r":
@@ -788,12 +1561,29 @@ class Review:
                 self.scroll = max(0, self.scroll - max(1, self.scr.getmaxyx()[0] - 7))
 
 
+def cmd_transcribe(store, args):
+    ctype = {".webm": "audio/webm", ".ogg": "audio/ogg", ".mp3": "audio/mpeg", ".mp4": "audio/mp4",
+             ".m4a": "audio/mp4"}.get(os.path.splitext(args.audio)[1].lower(), "audio/wav")
+    try:
+        with open(args.audio, "rb") as f:
+            print(transcribe(f.read(), ctype))
+    except (OSError, VoiceError) as e:
+        sys.exit(f"journeymaxx: {e}")
+
+
 def cmd_review(store, args):
     if not (sys.stdin.isatty() and sys.stdout.isatty()):
         args.status, args.json = None, False
         return cmd_list(store, args)
     locale.setlocale(locale.LC_ALL, "")
-    curses.wrapper(lambda scr: Review(scr, store).run())
+
+    def run(scr):
+        r = Review(scr, store)
+        r.autotalk = args.cmd == "talk"
+        if r.autotalk and r.mic and not r.mic.ready():
+            r.flash = r.mic.hint() + "; talking starts once it connects"
+        r.run()
+    curses.wrapper(run)
     print(summary(store.read()))
     print(store.path)
 
@@ -808,6 +1598,7 @@ def main():
     sub = p.add_subparsers(dest="cmd")
 
     sub.add_parser("review", help="review journeys (the default)")
+    sub.add_parser("talk", help="review by voice: it reads each journey out and you answer")
 
     a = sub.add_parser("add", help="queue journeys from stdin (markdown split by ---, or JSON)")
     a.add_argument("--title", help="add a single journey with this title; stdin is its body")
@@ -847,11 +1638,14 @@ def main():
     x = sub.add_parser("export", help="journeys as markdown")
     x.add_argument("--status", choices=STATUSES + ("all",), default="approved")
 
+    t = sub.add_parser("transcribe", help="speech to text for an audio file (checks the ElevenLabs key)")
+    t.add_argument("audio")
+
     args = p.parse_args()
     store = Store(find_file(args.file))
     handler = {"add": cmd_add, "revise": cmd_revise, "reply": cmd_reply, "ask": cmd_ask, "feedback": cmd_feedback,
                "wait": cmd_wait, "list": cmd_list, "show": cmd_show, "export": cmd_export,
-               "review": cmd_review, None: cmd_review}[args.cmd]
+               "transcribe": cmd_transcribe, "review": cmd_review, "talk": cmd_review, None: cmd_review}[args.cmd]
     try:
         handler(store, args)
     except ValueError as e:

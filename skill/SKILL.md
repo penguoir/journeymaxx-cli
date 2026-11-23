@@ -7,7 +7,7 @@ description: Put user journeys in front of Ori for review through the `journeyma
 
 `journeymaxx` is Ori's terminal review queue for user journeys.
 You queue journeys into a `.journeymaxx` JSON file; Ori runs `journeymaxx` in another pane and
-goes through them one at a time: enter approves, `c` sends you a message, ctrl+g edits the text
+goes through them one at a time: enter approves, `c` sends you a message (`v` to say it), ctrl+g edits the text
 in vim, `r` rejects. You read what he did and revise.
 
 ## The loop
@@ -58,6 +58,15 @@ in vim, `r` rejects. You read what he did and revise.
 - Nothing reaches Ori's queue unless he has to decide something: new journeys, revisions, and
   `ask`. `journeymaxx reply ID "..."` only leaves a note on the thread (status unchanged) and
   is rarely worth using.
+- Ori may review by voice: `journeymaxx talk` reads each journey out and he answers out loud,
+  or `v` speaks one message. A spoken answer arrives as a normal `comment` (or approve or
+  reject), but words can be misheard: read it for what he meant, and `ask` when a misheard
+  word changes the meaning. In talk mode your `revise -m` note and your `ask` message are
+  **read out to him**, so make each one short plain sentence with no markdown, and say what
+  changed ("Moved the club step first"), not "Done" or "Revised as requested". Keep revising
+  promptly while he talks: each revision you send comes back to him in the same session.
+  If he says voice is not working, `journeymaxx transcribe FILE` checks the key, and the
+  README's "Talking to it" covers the mic setup.
 - Never edit `.journeymaxx` by hand; go through the commands (they lock the file, and Ori's
   screen reloads as it changes).
 - `journeymaxx list`, `journeymaxx show ID` (with its thread) for a look at the state. Each
