@@ -48,11 +48,13 @@ the keyboard:
 | "no", "drop it", "reject it, coaches never see that" | rejected (anything after "reject it" is the reason) |
 | anything else ("no, step two should say…") | sent to Claude as your comment |
 | "next" / "skip" | moves on, decides nothing |
-| "repeat", "say that again" | reads it again |
+| "again please", "say that again", "one more time" | reads it again |
 | "undo", "go back" | puts your last decision back to pending |
 | "stop" | ends talk mode (or esc) |
 
-It says what it did ("Approved.", "Sent to Claude.") and goes to the next one. When Claude
+It chimes (rising for approved, falling for rejected, three notes for sent to Claude) and
+reads the next one straight away. A one or two word answer ends after 0.7 seconds of quiet;
+a longer one after 1.3, so a comment is not cut off while you think. When Claude
 revises a journey or asks you something, talk mode reads that out too ("Number 4, revised.
 Claude says: …"), so you and Claude go back and forth without leaving it. Space answers
 before it finishes reading.
@@ -65,9 +67,13 @@ enter again sends. Inside the message box, ctrl+r adds more speech.
 1. Your speech goes to ElevenLabs speech-to-text (Scribe). Put an ElevenLabs API key in
    `~/.config/journeymaxx/elevenlabs_api_key` (`chmod 600`), or set `ELEVENLABS_API_KEY`.
    `journeymaxx transcribe some.mp3` checks it works.
-2. Reading out uses a free voice: your browser's, `say` on macOS, `espeak` on Linux.
-   `JOURNEYMAXX_TTS=elevenlabs` uses ElevenLabs instead (`JOURNEYMAXX_VOICE` picks the voice
-   id). That uses your ElevenLabs character quota, and the free plan runs out after about one
+2. Reading out uses a free voice: your browser's, `say` on macOS (Karen, Australian), `espeak`
+   on Linux. On the mic page, pick the voice and the speed (1.5× to start) and press **Test**;
+   the page remembers them. Australian voices are listed first, natural-sounding ones on top:
+   Edge's "Natasha (Natural)" is the best free one, and on a Mac "Lee (Enhanced)" once you
+   download it in System Settings > Accessibility > Spoken Content.
+   `JOURNEYMAXX_TTS=elevenlabs` uses ElevenLabs instead (Charlie, Australian, at its top
+   speed; `JOURNEYMAXX_VOICE` picks another voice id). That uses your ElevenLabs character quota, and the free plan runs out after about one
    batch a month.
 3. Where the microphone and speaker are:
    - **On your own machine** (macOS, or Linux with PulseAudio): `ffmpeg` records.
@@ -80,7 +86,8 @@ enter again sends. Inside the message box, ctrl+r adds more speech.
 
    It picks the browser when `SSH_CONNECTION` is set or `ffmpeg` is missing. Force one with
    `JOURNEYMAXX_MIC=local` or `JOURNEYMAXX_MIC=browser`; `JOURNEYMAXX_MIC_PORT` changes the port.
-   `JOURNEYMAXX_PAUSE` is how many seconds of quiet end an answer (1.3).
+   `JOURNEYMAXX_PAUSE` is how many seconds of quiet end an answer (1.3), and
+   `JOURNEYMAXX_SHORT_PAUSE` a one or two word one (0.7).
 
 ## Commands for Claude
 

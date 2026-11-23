@@ -397,9 +397,10 @@ API = "https://api.elevenlabs.io/v1"
 STT_MODEL = os.environ.get("JOURNEYMAXX_STT_MODEL", "scribe_v2")
 TTS = os.environ.get("JOURNEYMAXX_TTS", "free")  # free: the browser's voice (or `say`); elevenlabs
 TTS_MODEL = os.environ.get("JOURNEYMAXX_TTS_MODEL", "eleven_flash_v2_5")
-VOICE_ID = os.environ.get("JOURNEYMAXX_VOICE", "onwK4e9ZLuTAKqWW03F9")  # Daniel, British
-SPEED = float(os.environ.get("JOURNEYMAXX_SPEED", "1.1"))
+VOICE_ID = os.environ.get("JOURNEYMAXX_VOICE", "IKne3meq5aSn9XLyUdCD")  # Charlie, Australian
+SPEED = float(os.environ.get("JOURNEYMAXX_SPEED", "1.2"))  # ElevenLabs allows 0.7 to 1.2
 PAUSE = float(os.environ.get("JOURNEYMAXX_PAUSE", "1.3"))  # seconds of quiet that end an answer
+SHORT_PAUSE = float(os.environ.get("JOURNEYMAXX_SHORT_PAUSE", "0.7"))  # ... a one or two word one
 MIC_PORT = int(os.environ.get("JOURNEYMAXX_MIC_PORT", "8737"))
 TTS_CACHE = os.path.expanduser("~/.cache/journeymaxx/tts")
 
@@ -612,9 +613,10 @@ class LocalMic:
             cmd = ["afplay", p] if sys.platform == "darwin" else \
                 ["ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet", p]
         elif sys.platform == "darwin":
-            cmd = ["say", "-r", "200", text]
+            cmd = ["say", "-v", os.environ.get("JOURNEYMAXX_SAY_VOICE", "Karen"), "-r",
+                   os.environ.get("JOURNEYMAXX_SAY_RATE", "270"), text]
         elif which("espeak-ng") or which("espeak"):
-            cmd = ["espeak-ng" if which("espeak-ng") else "espeak", text]
+            cmd = ["espeak-ng" if which("espeak-ng") else "espeak", "-v", "en-au", "-s", "260", text]
         else:
             return
         try:
@@ -625,6 +627,16 @@ class LocalMic:
 
     def speaking(self):
         return self.player is not None and self.player.poll() is None
+
+    def chime(self, kind):
+        sound = {"approve": "Glass", "reject": "Basso", "comment": "Pop", "skip": "Tink",
+                 "undo": "Tink"}.get(kind, "Tink")
+        if sys.platform == "darwin":
+            subprocess.Popen(["afplay", f"/System/Library/Sounds/{sound}.aiff"],
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        else:
+            sys.stdout.write("\a")
+            sys.stdout.flush()
 
     def hush(self):
         if self.speaking():
@@ -641,12 +653,38 @@ button{font:inherit;font-size:20px;padding:28px 40px;border-radius:999px;border:
 color:#eee;cursor:pointer;min-width:240px}
 .rec button{background:#d33}.play button{background:#2a6}
 .dim{color:#888;font-size:14px;margin-top:20px;max-width:30em}
+.opts{margin-top:28px;display:flex;gap:10px;flex-wrap:wrap;justify-content:center;align-items:center;font-size:14px;color:#aaa}
+.opts select,.opts button{font:inherit;font-size:14px;padding:6px 10px;border-radius:8px;min-width:0;background:#222;color:#eee;border:1px solid #444}
+.opts select{max-width:20em}
 </style></head><body><div><button id="b">Enable microphone</button>
-<p class="dim" id="s">Keep this tab open. In journeymaxx, t talks you through the queue and v speaks one message.</p></div>
+<p class="dim" id="s">Keep this tab open. In journeymaxx, t talks you through the queue and v speaks one message.</p>
+<div class="opts"><select id="vo" aria-label="Voice"></select>
+<label>Speed <input id="sp" type="range" min="1" max="2.5" step="0.1"> <span id="spv"></span></label>
+<button id="tv">Test</button></div></div>
 <script>
-const PAUSE=__PAUSE__;
+const PAUSE=__PAUSE__,SHORT=__SHORT__,TTS_SPEED=__SPEED__;
+const vo=document.getElementById('vo'),sp=document.getElementById('sp'),spv=document.getElementById('spv');
+const keep=(k,v)=>{try{localStorage.setItem(k,v)}catch(e){}},recall=k=>{try{return localStorage.getItem(k)}catch(e){return null}};
+let rate=parseFloat(recall('jmx-rate')||'1.5');const said=[]; // keep utterances alive: Chrome drops onend for collected ones
+function rank(v){ // Australian first, then natural-sounding voices, never the novelty ones
+  let r=/^en[-_]AU/i.test(v.lang)?100:/^en[-_](GB|NZ|IE)/i.test(v.lang)?20:/^en/i.test(v.lang)?10:-1;
+  if(r<0)return r;if(/natural|neural|online|premium|enhanced/i.test(v.name))r+=30;
+  if(/compact|eloquence|albert|bad news|bahh|bells|boing|bubbles|cellos|good news|jester|organ|superstar|trinoids|whisper|wobble|zarvox|grandma|grandpa|rocko|shelley|flo|reed|sandy/i.test(v.name))r-=60;
+  return r}
+function voices(){const vs=speechSynthesis.getVoices().filter(v=>rank(v)>=0).sort((a,b)=>rank(b)-rank(a));
+  if(!vs.length)return;const want=recall('jmx-voice');vo.innerHTML='';
+  vs.forEach(v=>{const o=document.createElement('option');o.value=v.voiceURI;o.textContent=v.name+' ('+v.lang+')';vo.appendChild(o)});
+  vo.value=vs.some(v=>v.voiceURI===want)?want:vs[0].voiceURI}
+const pick=()=>speechSynthesis.getVoices().find(v=>v.voiceURI===vo.value)||null;
+speechSynthesis.onvoiceschanged=voices;voices();
+const showRate=()=>{sp.value=rate;spv.textContent=rate.toFixed(1)+'×'};showRate();
+sp.oninput=()=>{rate=parseFloat(sp.value);showRate();keep('jmx-rate',rate)};
+vo.onchange=()=>keep('jmx-voice',vo.value);
+document.getElementById('tv').onclick=()=>{speechSynthesis.cancel();
+  const u=new SpeechSynthesisUtterance("I attach a report to players, and pick which players get it. The report becomes a tab on each player's page.");
+  try{u.voice=pick()}catch(e){}u.rate=rate;said.push(u);speechSynthesis.speak(u)};
 const b=document.getElementById('b'),s=document.getElementById('s');
-let v=0,seq=0,stream=null,mr=null,chunks=[],enabled=false,ctx=null,vad=null,playing=0,audio=null;
+let v=0,seq=0,stream=null,mr=null,chunks=[],enabled=false,ctx=null,vad=null,playing=0,audio=null,chimed=0,releaseT=null;
 const say=t=>{s.textContent=t};
 const post=u=>fetch(u,{method:'POST'}).catch(()=>{});
 const idle=()=>{document.body.className='';b.textContent=enabled?'Talk':'Enable microphone';
@@ -658,28 +696,37 @@ b.onclick=async()=>{
     enabled=true;idle()}catch(e){say('Microphone blocked: '+e.message)}return}
   post('/toggle');
 };
-function beep(){if(!ctx)return;const o=ctx.createOscillator(),g=ctx.createGain();o.frequency.value=880;
-  g.gain.value=0.12;o.connect(g);g.connect(ctx.destination);o.start();o.stop(ctx.currentTime+0.09)}
+function tones(fs,len){if(!ctx)return;fs.forEach((f,i)=>{const o=ctx.createOscillator(),g=ctx.createGain(),t=ctx.currentTime+i*len;
+  o.frequency.value=f;g.gain.setValueAtTime(0.12,t);g.gain.exponentialRampToValueAtTime(0.001,t+len*0.95);
+  o.connect(g);g.connect(ctx.destination);o.start(t);o.stop(t+len)})}
+function beep(){tones([880],0.08)}
+const CHIMES={approve:[660,990],reject:[440,300],comment:[660,880,660],skip:[550],undo:[990,660]};
 function listenFor(n){ // voice activity: report the first speech, then the pause that ends it
   const src=ctx.createMediaStreamSource(stream),proc=ctx.createScriptProcessor(2048,1,1),g=ctx.createGain();
   g.gain.value=0;src.connect(proc);proc.connect(g);g.connect(ctx.destination);
-  const dt=2048/ctx.sampleRate*1000;let floor=0.004,talking=false,loud=0,quiet=0,t=0,done=false;
-  proc.onaudioprocess=e=>{t+=dt;if(t<200||done)return;const d=e.inputBuffer.getChannelData(0);let sum=0;
+  const dt=2048/ctx.sampleRate*1000;let floor=0.004,talking=false,loud=0,quiet=0,t=0,done=false,peak=0,spoke=0;
+  proc.onaudioprocess=e=>{t+=dt;if(t<120||done)return;const d=e.inputBuffer.getChannelData(0);let sum=0;
     for(let i=0;i<d.length;i++)sum+=d[i]*d[i];const rms=Math.sqrt(sum/d.length),thr=Math.max(0.012,floor*3);
-    if(rms>thr){loud+=dt;quiet=0;if(!talking&&loud>150){talking=true;post('/heard?seq='+n)}}
+    peak=Math.max(rms,peak*0.995); // quiet is judged against how loud you talk, so room noise cannot hold it open
+    if(rms>thr&&(!talking||rms>peak*0.15)){loud+=dt;quiet=0;if(talking)spoke+=dt;
+      if(!talking&&loud>120){talking=true;spoke=loud;post('/heard?seq='+n)}}
     else{quiet+=dt;if(!talking){loud=0;floor=floor*0.9+rms*0.1}}
-    if(talking&&quiet>PAUSE*1000){done=true;post('/silence?seq='+n)}};
+    if(talking&&quiet>(spoke<1200?SHORT:PAUSE)*1000){done=true;post('/silence?seq='+n);
+      if(vad){vad.src.disconnect();vad.proc.disconnect();vad.g.disconnect();vad=null}
+      if(mr&&mr.state==='recording')mr.stop()}};
   vad={src,proc,g};
 }
+function release(){clearTimeout(releaseT);releaseT=setTimeout(()=>{ // close the mic once talking has stopped
+  if(stream&&!(mr&&mr.state==='recording')){stream.getTracks().forEach(t=>t.stop());stream=null}},30000)}
 async function start(n,auto){
-  chunks=[];
-  try{stream=await mic()}catch(e){
+  chunks=[];clearTimeout(releaseT);
+  try{if(!stream||!stream.getAudioTracks().some(t=>t.readyState==='live'))stream=await mic()}catch(e){
     await fetch('/audio?seq='+n+'&error='+encodeURIComponent(e.message),{method:'POST'});return}
   enabled=true;if(!ctx)ctx=new AudioContext();ctx.resume();
   const type=['audio/webm;codecs=opus','audio/webm','audio/mp4'].find(t=>MediaRecorder.isTypeSupported(t));
   mr=new MediaRecorder(stream,type?{mimeType:type}:{});
   mr.ondataavailable=e=>chunks.push(e.data);
-  mr.onstop=async()=>{stream.getTracks().forEach(t=>t.stop());
+  mr.onstop=async()=>{release();
     const blob=new Blob(chunks,{type:mr.mimeType});
     await fetch('/audio?seq='+n,{method:'POST',headers:{'Content-Type':mr.mimeType||'audio/webm'},body:blob})};
   beep();mr.start();if(auto)listenFor(n);
@@ -692,11 +739,10 @@ function play(p){
   playing=p.n;document.body.className='play';b.textContent='Speaking… (answer now)';say(p.text);
   const end=()=>{if(playing===p.n){playing=0;post('/played?n='+p.n);idle()}};
   const speak=()=>{ // one sentence at a time: Chrome's voices stop partway through long text
-    const vs=speechSynthesis.getVoices(),voice=vs.find(x=>x.lang==='en-GB')||vs.find(x=>/^en/.test(x.lang))||null;
-    const parts=p.text.match(/[^.!?:]+[.!?:]*/g)||[p.text];speechSynthesis.cancel();
-    parts.forEach((t,i)=>{const u=new SpeechSynthesisUtterance(t.trim());u.voice=voice;u.rate=1.15;
+    const voice=pick(),parts=p.text.match(/[^.!?:]+[.!?:]*/g)||[p.text];speechSynthesis.cancel();said.length=0;
+    parts.forEach((t,i)=>{const u=new SpeechSynthesisUtterance(t.trim());try{u.voice=voice}catch(e){}u.rate=rate;said.push(u);
       if(i===parts.length-1){u.onend=end;u.onerror=end}speechSynthesis.speak(u)})};
-  if(p.audio){audio=new Audio('/tts?n='+p.n);audio.onended=end;audio.onerror=speak;audio.play().catch(speak)}
+  if(p.audio){audio=new Audio('/tts?n='+p.n);audio.playbackRate=Math.max(1,rate/TTS_SPEED);audio.onended=end;audio.onerror=speak;audio.play().catch(speak)}
   else speak();
 }
 function hush(){if(audio){audio.onended=null;audio.pause();audio=null}speechSynthesis.cancel();playing=0;idle()}
@@ -705,6 +751,7 @@ function hush(){if(audio){audio.onended=null;audio.pause();audio=null}speechSynt
   if(r.recording&&r.seq!==seq){seq=r.seq;start(seq,r.auto)}
   else if(!r.recording&&mr&&mr.state==='recording')stop();
   if(r.play&&r.play.n!==playing)play(r.play);else if(!r.play&&playing)hush();
+  if(r.chime&&r.chime.n!==chimed){chimed=r.chime.n;tones(CHIMES[r.chime.kind]||[660],0.07)}
 }catch(e){say('journeymaxx is not running. Start it and reload.');await new Promise(z=>setTimeout(z,3000))}}})();
 </script></body></html>"""
 
@@ -717,6 +764,7 @@ class BrowserMic:
         self.cv = threading.Condition()
         self.v, self.seq, self.recording, self.auto, self.last_seen = 0, 0, False, False, 0.0
         self.play, self.play_n, self.played_n, self.tts = None, 0, 0, {}
+        self.chime_state = None
         self.audio = {}
         self.requested = self.stop_requested = self.heard = False
         for port in range(MIC_PORT, MIC_PORT + 10):
@@ -761,7 +809,7 @@ class BrowserMic:
             def do_GET(self):
                 route, q = urllib.parse.urlparse(self.path).path, self.query()
                 if route == "/":
-                    return self.send(200, MIC_PAGE.replace("__PAUSE__", str(PAUSE)), "text/html; charset=utf-8")
+                    return self.send(200, MIC_PAGE.replace("__PAUSE__", str(PAUSE)).replace("__SHORT__", str(SHORT_PAUSE)).replace("__SPEED__", str(SPEED)), "text/html; charset=utf-8")
                 if route == "/tts":
                     data = mic.tts.get(int(q.get("n", 0) or 0))
                     return self.send(200, data, "audio/mpeg") if data else self.send(404, "{}")
@@ -773,7 +821,7 @@ class BrowserMic:
                         mic.last_seen = time.time()
                         play = mic.play and {k: mic.play[k] for k in ("n", "text", "audio")}
                         state = {"v": mic.v, "seq": mic.seq, "recording": mic.recording,
-                                 "auto": mic.auto, "play": play}
+                                 "auto": mic.auto, "play": play, "chime": mic.chime_state}
                     return self.send(200, json.dumps(state))
                 self.send(404, "{}")
 
@@ -860,6 +908,12 @@ class BrowserMic:
                 self.bump()
             return self.play is not None
 
+    def chime(self, kind):
+        with self.cv:
+            n = (self.chime_state or {}).get("n", 0) + 1
+            self.chime_state = {"n": n, "kind": kind}
+            self.bump()
+
     def hush(self):
         with self.cv:
             if self.play:
@@ -905,6 +959,8 @@ def intent(text):
     while len(words) > 1 and words[-1] in TRAILING:
         words.pop()
     p, w = " ".join(words), set(words)
+    if w & {"again", "repeat", "reread", "pardon"} and len(words) <= 7 or p in {"one more time", "once more"}:
+        return "repeat", None
     for name, phrases in (("skip", SKIP), ("repeat", REPEAT), ("undo", UNDO), ("stop", STOP)):
         if p in phrases:
             return name, None
@@ -1170,7 +1226,7 @@ class Review:
             self.flash = self.mic.hint()
             return
         self.talking = True
-        SPEECH.prefetch(*ACKS.values(), "Undone.", "All caught up. I'll read out what Claude sends back.")
+        SPEECH.prefetch("All caught up.")
         spoken, last, failures, caught_up = None, None, 0, False
         try:
             while True:
@@ -1183,7 +1239,7 @@ class Review:
                 if j is None:
                     if not caught_up:
                         caught_up = True
-                        if self.say("All caught up. I'll read out what Claude sends back.") == "stop":
+                        if self.say("All caught up.") == "stop":
                             return
                     self.status_line("All caught up · waiting for Claude", "esc stop talking", "claude")
                     try:
@@ -1223,8 +1279,7 @@ class Review:
                     self.goto(last)
                     self.change(lambda j: (set_status(j, "pending"), event(j, "reviewer", "reopened")))
                     last, spoken = None, None
-                    if self.say("Undone.") == "stop":
-                        return
+                    self.mic.chime("undo")
                     continue
                 if action == "approve":
                     self.change(lambda j: (set_status(j, "approved"), event(j, "reviewer", "approved")))
@@ -1237,8 +1292,8 @@ class Review:
                 last = j["id"] if action != "skip" else last
                 self.next_pending()
                 spoken = None
-                if self.say(ACKS[action]) == "stop":
-                    return
+                self.mic.chime(action)
+                self.flash = f"{ACKS[action]} (heard: {text})"
         finally:
             self.talking = False
             if self.mic:
