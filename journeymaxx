@@ -513,14 +513,19 @@ SPEECH = Speech()
 
 
 def speakable(md):
-    """Light markdown to sentences a voice can read."""
-    out = []
+    """Light markdown to sentences a voice can read. A line that does not start a new bullet
+    continues the one before it (hard-wrapped text)."""
+    items = []
     for line in md.splitlines():
-        line = re.sub(r"^\s*([-*•]|\d+[.)]|#+)\s+", "", line)
-        line = line.replace("**", "").replace("`", "").strip()
-        if line:
-            out.append(line if line[-1] in ".!?:;" else line + ".")
-    return " ".join(out)
+        new = re.match(r"^\s*([-*•]|\d+[.)]|#+)\s+", line)
+        line = re.sub(r"^\s*([-*•]|\d+[.)]|#+)\s+", "", line).replace("**", "").replace("`", "").strip()
+        if not line:
+            continue
+        if items and not new and items[-1][-1] not in ".!?:;":
+            items[-1] += " " + line
+        else:
+            items.append(line)
+    return " ".join(i if i[-1] in ".!?:;" else i + "." for i in items)
 
 
 def which(cmd):
@@ -915,16 +920,13 @@ def intent(text):
 
 
 def script(j):
-    """What talk mode says to put a journey in front of you."""
+    """What talk mode reads out: the journey's own text, nothing else. A question from Claude
+    is read instead, since that is what needs an answer."""
     last = next((e for e in reversed(j["history"]) if e["by"] == "claude"
                  and e["action"] in ("revised", "question")), None)
-    body = speakable(j["body"])
-    if last and last["action"] == "question":
-        return f"Claude asks about number {j['id']}, {j['title']}: {last.get('message', '')}"
-    if last and last["action"] == "revised":
-        note = f" Claude says: {last['message'].rstrip('.')}." if last.get("message") else ""
-        return f"Number {j['id']}, revised.{note} {j['title']}. {body}"
-    return f"Number {j['id']}. {j['title']}. {body}"
+    if last and last["action"] == "question" and last.get("message"):
+        return speakable(last["message"])
+    return speakable(j["body"]) or j["title"]
 
 
 ACKS = {"approve": "Approved.", "reject": "Rejected.", "comment": "Sent to Claude.", "skip": "Skipped."}
@@ -1170,8 +1172,6 @@ class Review:
         self.talking = True
         SPEECH.prefetch(*ACKS.values(), "Undone.", "All caught up. I'll read out what Claude sends back.")
         spoken, last, failures, caught_up = None, None, 0, False
-        n = counts(self.data)["pending"]
-        intro = f"{n} to review. " if n > 1 else ""
         try:
             while True:
                 if self.store.mtime() != self.mtime:
@@ -1195,9 +1195,8 @@ class Review:
                 caught_up = False
                 if spoken != j["id"]:
                     spoken = j["id"]
-                    if self.say(intro + script(j)) == "stop":
+                    if self.say(script(j)) == "stop":
                         return
-                    intro = ""
                     nxt = self.peek_next(j["id"])
                     if nxt:
                         SPEECH.prefetch(script(nxt))
