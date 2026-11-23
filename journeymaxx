@@ -3,7 +3,8 @@
 
 Claude writes journeys into a .journeymaxx file (JSON); you run `journeymaxx`
 next to the Claude session and go through them: enter approves, c sends Claude
-a message, ctrl+g edits in vim, r rejects.
+a message, v says it out loud (ElevenLabs speech-to-text), ctrl+g edits in vim,
+r rejects.
 
   You:     journeymaxx                      review (TUI)
   Claude:  journeymaxx add < journeys.md    queue journeys (markdown split by ---, or JSON)
@@ -27,8 +28,14 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
 from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 FILENAME = ".journeymaxx"
 STATUSES = ("pending", "approved", "changes_requested", "rejected")
@@ -382,6 +389,284 @@ def cmd_export(store, args):
     print("\n\n".join(f"**{j['title']}**\n\n{j['body']}".strip() for j in js))
 
 
+# ---------------------------------------------------------------- voice (ElevenLabs)
+
+KEY_FILE = os.path.expanduser("~/.config/journeymaxx/elevenlabs_api_key")
+STT_URL = "https://api.elevenlabs.io/v1/speech-to-text"
+STT_MODEL = os.environ.get("JOURNEYMAXX_STT_MODEL", "scribe_v2")
+MIC_PORT = int(os.environ.get("JOURNEYMAXX_MIC_PORT", "8737"))
+
+
+class VoiceError(Exception):
+    pass
+
+
+def api_key():
+    key = os.environ.get("ELEVENLABS_API_KEY", "").strip()
+    if not key:
+        try:
+            with open(KEY_FILE, encoding="utf-8") as f:
+                key = f.read().strip()
+        except FileNotFoundError:
+            pass
+    if not key:
+        raise VoiceError(f"no ElevenLabs key: set ELEVENLABS_API_KEY or put it in {KEY_FILE}")
+    return key
+
+
+def transcribe(audio, content_type="audio/wav"):
+    """Speech to text with ElevenLabs Scribe. Returns the transcript."""
+    ext = {"webm": "webm", "ogg": "ogg", "mp4": "mp4", "mpeg": "mp3", "wav": "wav"}
+    name = "speech." + next((v for k, v in ext.items() if k in content_type), "wav")
+    boundary = uuid.uuid4().hex
+    parts = []
+    for field, value in (("model_id", STT_MODEL), ("tag_audio_events", "false")):
+        parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="{field}"\r\n\r\n{value}\r\n'.encode())
+    parts.append(f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
+                 f"Content-Type: {content_type}\r\n\r\n".encode() + audio + b"\r\n")
+    parts.append(f"--{boundary}--\r\n".encode())
+    req = urllib.request.Request(STT_URL, data=b"".join(parts), method="POST", headers={
+        "xi-api-key": api_key(), "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    try:
+        with urllib.request.urlopen(req, timeout=90) as r:
+            return json.loads(r.read()).get("text", "").strip()
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        try:
+            d = json.loads(detail)["detail"]
+            detail = d.get("message", d) if isinstance(d, dict) else d
+        except (ValueError, KeyError, TypeError):
+            pass
+        raise VoiceError(f"ElevenLabs {e.code}: {str(detail)[:160]}")
+    except (urllib.error.URLError, OSError) as e:
+        raise VoiceError(f"could not reach ElevenLabs: {e}")
+
+
+class LocalMic:
+    """Records from this machine's microphone with ffmpeg."""
+    kind = "local"
+
+    def __init__(self):
+        self.proc, self.path = None, None
+        self.requested = self.stop_requested = False
+
+    def ready(self):
+        return True
+
+    def hint(self):
+        return ""
+
+    def start(self):
+        if sys.platform == "darwin":
+            src = ["-f", "avfoundation", "-i", os.environ.get("JOURNEYMAXX_MIC_DEVICE", ":0")]
+        else:
+            src = ["-f", "pulse", "-i", os.environ.get("JOURNEYMAXX_MIC_DEVICE", "default")]
+        fd, self.path = tempfile.mkstemp(prefix="journeymaxx-", suffix=".wav")
+        os.close(fd)
+        try:
+            self.proc = subprocess.Popen(
+                ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", *src,
+                 "-ac", "1", "-ar", "16000", self.path],
+                stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except OSError as e:
+            raise VoiceError(f"could not start ffmpeg: {e}")
+        time.sleep(0.3)
+        if self.proc.poll() is not None:
+            os.unlink(self.path)
+            err = self.proc.stderr.read().decode("utf-8", "replace").strip().splitlines()
+            raise VoiceError("no microphone: " + (err[-1] if err else "ffmpeg exited") +
+                             " (JOURNEYMAXX_MIC=browser records in a browser instead)")
+
+    def stop(self):
+        try:
+            self.proc.communicate(b"q", timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+            self.proc.wait()
+        try:
+            with open(self.path, "rb") as f:
+                return f.read(), "audio/wav"
+        finally:
+            os.unlink(self.path)
+
+    def cancel(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        if self.path and os.path.exists(self.path):
+            os.unlink(self.path)
+
+
+MIC_PAGE = """<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>journeymaxx mic</title>
+<style>
+body{font:16px system-ui,sans-serif;margin:0;min-height:100vh;display:flex;align-items:center;
+justify-content:center;background:#111;color:#eee;text-align:center}
+button{font:inherit;font-size:20px;padding:28px 40px;border-radius:999px;border:0;background:#333;
+color:#eee;cursor:pointer;min-width:240px}
+.rec button{background:#d33}.dim{color:#888;font-size:14px;margin-top:20px;max-width:30em}
+</style></head><body><div><button id="b">Enable microphone</button>
+<p class="dim" id="s">Keep this tab open. Press <b>v</b> in journeymaxx to talk, enter to send.</p></div>
+<script>
+const b=document.getElementById('b'),s=document.getElementById('s');
+let seq=0,rec=false,stream=null,mr=null,chunks=[],enabled=false;
+const say=t=>{s.textContent=t};
+if(!window.isSecureContext) say('The microphone only works on http://localhost. Forward the port (ssh -L '+location.port+':localhost:'+location.port+') and open http://localhost:'+location.port);
+async function mic(){return navigator.mediaDevices.getUserMedia({audio:true})}
+b.onclick=async()=>{
+  if(!enabled){try{(await mic()).getTracks().forEach(t=>t.stop());enabled=true;b.textContent='Talk';
+    say('Ready. Press v in journeymaxx (or this button) to talk.')}catch(e){say('Microphone blocked: '+e.message)}return}
+  fetch('/toggle',{method:'POST'});
+};
+async function start(n){
+  chunks=[];
+  try{stream=await mic()}catch(e){
+    await fetch('/audio?seq='+n+'&error='+encodeURIComponent(e.message),{method:'POST'});return}
+  enabled=true;
+  const type=['audio/webm;codecs=opus','audio/webm','audio/mp4'].find(t=>MediaRecorder.isTypeSupported(t));
+  mr=new MediaRecorder(stream,type?{mimeType:type}:{});
+  mr.ondataavailable=e=>chunks.push(e.data);
+  mr.onstop=async()=>{stream.getTracks().forEach(t=>t.stop());
+    const blob=new Blob(chunks,{type:mr.mimeType});
+    await fetch('/audio?seq='+n,{method:'POST',headers:{'Content-Type':mr.mimeType||'audio/webm'},body:blob})};
+  mr.start();document.body.className='rec';b.textContent='Listening… (stop)';say('Listening. Enter in journeymaxx to stop.');
+}
+function stop(){if(mr&&mr.state!=='inactive')mr.stop();document.body.className='';
+  b.textContent=enabled?'Talk':'Enable microphone';say('Ready. Press v in journeymaxx (or this button) to talk.')}
+(async()=>{for(;;){try{
+  const r=await(await fetch('/poll?seq='+seq+'&rec='+(rec?1:0))).json();
+  if(r.recording&&(!rec||r.seq!==seq)){seq=r.seq;rec=true;start(seq)}
+  else if(!r.recording&&rec){rec=false;seq=r.seq;stop()}
+  else seq=r.seq;
+}catch(e){say('journeymaxx is not running. Start it and reload.');await new Promise(z=>setTimeout(z,3000))}}})();
+</script></body></html>"""
+
+
+class BrowserMic:
+    """For an SSH session with no microphone: a page on localhost records in your browser."""
+    kind = "browser"
+
+    def __init__(self):
+        self.cv = threading.Condition()
+        self.seq, self.recording, self.last_seen = 0, False, 0.0
+        self.audio = {}
+        self.requested = self.stop_requested = False
+        mic = self
+        for port in range(MIC_PORT, MIC_PORT + 10):
+            try:
+                self.server = ThreadingHTTPServer(("127.0.0.1", port), self.handler(mic))
+                break
+            except OSError:
+                continue
+        else:
+            raise VoiceError(f"ports {MIC_PORT}-{MIC_PORT + 9} are all in use")
+        self.server.daemon_threads = True
+        self.port = self.server.server_address[1]
+        self.url = f"http://localhost:{self.port}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    @staticmethod
+    def handler(mic):
+        class H(BaseHTTPRequestHandler):
+            def log_message(self, *a):  # stderr would draw over the TUI
+                pass
+
+            def send(self, code, body, ctype="application/json"):
+                body = body.encode() if isinstance(body, str) else body
+                self.send_response(code)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(body)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(body)
+
+            def query(self):
+                return dict(urllib.parse.parse_qsl(urllib.parse.urlparse(self.path).query))
+
+            def local_origin(self):
+                origin = self.headers.get("Origin")
+                return not origin or urllib.parse.urlparse(origin).hostname in ("localhost", "127.0.0.1")
+
+            def do_GET(self):
+                route = urllib.parse.urlparse(self.path).path
+                if route == "/":
+                    return self.send(200, MIC_PAGE, "text/html; charset=utf-8")
+                if route == "/poll":
+                    q = self.query()
+                    have = (int(q.get("seq", 0) or 0), q.get("rec") == "1")
+                    with mic.cv:
+                        mic.last_seen = time.time()
+                        mic.cv.wait_for(lambda: (mic.seq, mic.recording) != have, timeout=20)
+                        mic.last_seen = time.time()
+                        state = {"seq": mic.seq, "recording": mic.recording}
+                    return self.send(200, json.dumps(state))
+                self.send(404, "{}")
+
+            def do_POST(self):
+                if not self.local_origin():
+                    return self.send(403, "{}")
+                route = urllib.parse.urlparse(self.path).path
+                body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                with mic.cv:
+                    if route == "/toggle":
+                        if mic.recording:
+                            mic.stop_requested = True
+                        else:
+                            mic.requested = True
+                    elif route == "/audio":
+                        q = self.query()
+                        mic.audio[int(q.get("seq", 0) or 0)] = (
+                            body, self.headers.get("Content-Type", "audio/webm"), q.get("error"))
+                    else:
+                        return self.send(404, "{}")
+                    mic.cv.notify_all()
+                self.send(200, "{}")
+        return H
+
+    def ready(self):
+        return time.time() - self.last_seen < 30
+
+    def hint(self):
+        return (f"open {self.url} in a browser to talk (over SSH forward it first: "
+                f"ssh -L {self.port}:localhost:{self.port} <this host>)")
+
+    def start(self):
+        if not self.ready():
+            raise VoiceError(self.hint())
+        with self.cv:
+            self.seq += 1
+            self.recording, self.requested, self.stop_requested = True, False, False
+            self.cv.notify_all()
+
+    def stop(self):
+        with self.cv:
+            self.recording = False
+            self.cv.notify_all()
+            n = self.seq
+            if not self.cv.wait_for(lambda: n in self.audio, timeout=20):
+                raise VoiceError("the browser did not send the recording")
+            audio, ctype, err = self.audio.pop(n)
+        if err:
+            raise VoiceError(f"browser microphone: {err}")
+        return audio, ctype
+
+    def cancel(self):
+        with self.cv:
+            self.recording = self.stop_requested = False
+            self.audio.clear()
+            self.cv.notify_all()
+
+
+def make_mic():
+    """JOURNEYMAXX_MIC=local|browser; by default the browser over SSH, else this machine."""
+    choice = os.environ.get("JOURNEYMAXX_MIC", "").lower()
+    if not choice:
+        over_ssh = os.environ.get("SSH_CONNECTION") or os.environ.get("SSH_TTY")
+        no_ffmpeg = subprocess.call(["sh", "-c", "command -v ffmpeg"], stdout=subprocess.DEVNULL) != 0
+        choice = "browser" if over_ssh or no_ffmpeg else "local"
+    return BrowserMic() if choice == "browser" else LocalMic()
+
+
 # ---------------------------------------------------------------- TUI
 
 def md_lines(text, width, base=0):
@@ -441,6 +726,12 @@ class Review:
         self.diff = False
         self.flash = ""
         self.color = {}
+        self.mic = None
+        self.mic_error = ""
+        try:
+            self.mic = make_mic()
+        except VoiceError as e:
+            self.mic_error = str(e)
 
     # -- state
 
@@ -498,17 +789,79 @@ class Review:
             self.flash = f"#{j['id']} approved"
         self.next_pending()
 
-    def comment(self):
+    def comment(self, initial=""):
         j = self.journey()
         if j is None:
             return
-        text = self.prompt(f"Message to Claude about #{j['id']}")
+        text = self.prompt(f"Message to Claude about #{j['id']}", initial=initial)
         if not text:
             return
         self.change(lambda j: (set_status(j, "changes_requested"),
                                event(j, "reviewer", "comment", message=text)))
         self.flash = f"#{j['id']} sent to Claude"
         self.next_pending()
+
+    def listen(self):
+        """Record until enter, transcribe, return the text (None when cancelled or failed)."""
+        if self.mic is None:
+            self.flash = self.mic_error
+            return None
+        try:
+            self.mic.start()
+        except VoiceError as e:
+            self.mic.requested = False
+            self.flash = str(e)
+            return None
+        started = time.time()
+        self.scr.timeout(200)
+        try:
+            while True:
+                self.status_line(f"● Listening {int(time.time() - started)}s",
+                                 "enter stop and send to the message box · esc cancel", "rejected")
+                try:
+                    ch = self.scr.get_wch()
+                except curses.error:
+                    ch = None
+                except KeyboardInterrupt:
+                    ch = "\x1b"
+                if ch == "\x1b":
+                    self.mic.cancel()
+                    self.flash = "recording cancelled"
+                    return None
+                if ch in ("\n", "\r", curses.KEY_ENTER, "v", " ") or self.mic.stop_requested:
+                    break
+            self.status_line("Transcribing…", "", "claude")
+            audio, ctype = self.mic.stop()
+            text = transcribe(audio, ctype)
+        except VoiceError as e:
+            self.mic.cancel()
+            self.flash = str(e)
+            return None
+        finally:
+            self.scr.timeout(400)
+        if not text:
+            self.flash = "did not catch anything; press v to try again"
+            return None
+        return text
+
+    def voice(self):
+        if self.journey() is None:
+            if self.mic:
+                self.mic.requested = False
+            return
+        text = self.listen()
+        if text:
+            self.comment(initial=text)
+
+    def status_line(self, msg, keys, color):
+        self.draw()
+        h, _ = self.scr.getmaxyx()
+        for y in (h - 2, h - 1):
+            self.scr.move(y, 0)
+            self.scr.clrtoeol()
+        self.put(h - 2, 2, msg, self.color.get(color, 0) | curses.A_BOLD)
+        self.put(h - 1, 1, keys, curses.A_DIM)
+        self.scr.refresh()
 
     def reject(self):
         j = self.journey()
@@ -637,6 +990,9 @@ class Review:
         self.put(0, 1, "journeymaxx", curses.A_BOLD)
         self.put(0, 14, summary(self.data), curses.A_DIM)
         self.put(0, max(14, w - len(pos) - 2), pos, curses.A_DIM)
+        if self.mic and self.mic.kind == "browser":
+            mic = "mic ready" if self.mic.ready() else f"mic: open {self.mic.url}"
+            self.put(1, max(14, w - len(mic) - 2), mic, curses.A_DIM)
 
         keys = "↑↓ move · q quit"
         if j is None:
@@ -657,16 +1013,16 @@ class Review:
                     x += len(text)
             if self.scroll + avail < len(rows):
                 self.put(h - 3, 2, "▼ more (space)", curses.A_DIM)
-            keys = ("enter approve · c message Claude · ^G edit · r reject · u undo"
+            keys = ("enter approve · c message Claude · v speak · ^G edit · r reject · u undo"
                     + (" · d diff" if has_prev else "") + " · ↑↓ move · n next pending · q quit")
         if self.flash:
             self.put(h - 2, 2, self.flash, self.color.get("approved", 0))
         self.put(h - 1, 1, keys, curses.A_DIM)
         scr.refresh()
 
-    def prompt(self, label, allow_empty=False):
+    def prompt(self, label, allow_empty=False, initial=""):
         """One-field input at the bottom. Returns the text, or None when cancelled."""
-        buf = ""
+        buf = initial
         self.scr.timeout(-1)
         curses.curs_set(1)
         try:
@@ -687,7 +1043,7 @@ class Review:
                     self.put(top + 1 + n, 1, "> " if n == 0 else "  ", curses.A_DIM)
                     self.put(top + 1 + n, 3, line.replace("█", ""))
                 last = lines[-1].replace("█", "")
-                self.put(h - 1, 1, "enter send · esc cancel · ^G write in editor", curses.A_DIM)
+                self.put(h - 1, 1, "enter send · esc cancel · ^R speak · ^G write in editor", curses.A_DIM)
                 try:
                     self.scr.move(top + len(lines), min(w - 2, 3 + len(last)))
                 except curses.error:
@@ -710,6 +1066,13 @@ class Review:
                     edited = self.editor(buf)
                     if edited is not None:
                         buf = edited.strip()
+                elif ch == "\x12":
+                    curses.curs_set(0)
+                    said = self.listen()
+                    self.scr.timeout(-1)
+                    curses.curs_set(1)
+                    if said:
+                        buf = (buf.rstrip() + " " + said).strip()
                 elif ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
                     buf = buf[:-1]
                 elif ch == "\x15":
@@ -748,6 +1111,9 @@ class Review:
                 self.cur = None
             if self.cur is None:
                 self.next_pending()  # jump to new work as soon as Claude adds it
+            if self.mic and self.mic.requested:  # "Talk" pressed on the mic page
+                self.voice()
+                continue
             self.draw()
             try:
                 ch = self.scr.get_wch()
@@ -762,6 +1128,8 @@ class Review:
                 self.approve()
             elif ch in ("c", "C"):
                 self.comment()
+            elif ch in ("v", "V"):
+                self.voice()
             elif ch in ("\x07", "e"):
                 self.edit()
             elif ch == "r":
@@ -786,6 +1154,16 @@ class Review:
                 self.scroll += max(1, self.scr.getmaxyx()[0] - 7)
             elif ch in ("b", curses.KEY_PPAGE):
                 self.scroll = max(0, self.scroll - max(1, self.scr.getmaxyx()[0] - 7))
+
+
+def cmd_transcribe(store, args):
+    ctype = {".webm": "audio/webm", ".ogg": "audio/ogg", ".mp3": "audio/mpeg", ".mp4": "audio/mp4",
+             ".m4a": "audio/mp4"}.get(os.path.splitext(args.audio)[1].lower(), "audio/wav")
+    try:
+        with open(args.audio, "rb") as f:
+            print(transcribe(f.read(), ctype))
+    except (OSError, VoiceError) as e:
+        sys.exit(f"journeymaxx: {e}")
 
 
 def cmd_review(store, args):
@@ -847,11 +1225,14 @@ def main():
     x = sub.add_parser("export", help="journeys as markdown")
     x.add_argument("--status", choices=STATUSES + ("all",), default="approved")
 
+    t = sub.add_parser("transcribe", help="speech to text for an audio file (checks the ElevenLabs key)")
+    t.add_argument("audio")
+
     args = p.parse_args()
     store = Store(find_file(args.file))
     handler = {"add": cmd_add, "revise": cmd_revise, "reply": cmd_reply, "ask": cmd_ask, "feedback": cmd_feedback,
                "wait": cmd_wait, "list": cmd_list, "show": cmd_show, "export": cmd_export,
-               "review": cmd_review, None: cmd_review}[args.cmd]
+               "transcribe": cmd_transcribe, "review": cmd_review, None: cmd_review}[args.cmd]
     try:
         handler(store, args)
     except ValueError as e:
