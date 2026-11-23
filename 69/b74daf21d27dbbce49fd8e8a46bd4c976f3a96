@@ -1,0 +1,23 @@
+README.md
+  s_d45eaeb59eb677::t_214accbccedb81 10-11,38,40-41,43-53
+journeymaxx
+  s_d45eaeb59eb677::t_1d0bf279702cd5 395,428-442,446,450-451,459,468-469,476-477,482-483,507,509,512,515,517-519,521,525,532,534-535,537-540,546,551,553-554,557,591,593,595-596,599,601,608,617-619,633,638-639,644,657,665-666,804-805,807-808,810,813-814,816,819-820,831,838-839,843-844,1016,1114,1174,1235
+skill/SKILL.md
+  s_d45eaeb59eb677::t_84a5428b34b3ed 61-64
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "69b74daf21d27dbbce49fd8e8a46bd4c976f3a96",
+  "prompts": {},
+  "sessions": {
+    "s_d45eaeb59eb677": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "dbbc9adf-1678-4d57-aaba-f9618126da4b",
+        "model": "claude-opus-5-5"
+      },
+      "human_author": "Ori Marash <ori@framesports.ai>"
+    }
+  }
+}
